@@ -1,0 +1,31 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - EGG: BINDWA BOT",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-08-17T03:40:00+07:00",
+    "name": "BindWA Bot",
+    "author": "support@pterodactyl.io",
+    "description": "WhatsApp Bot Service untuk Minecraft Server",
+    "features": null,
+    "docker_images": {
+        "Debian": "ghcr.io/pterodactyl/yolks:debian"
+    },
+    "file_denylist": [],
+    "startup": "bash -c \"chmod +x bot-app 2>/dev/null; ./bot-app -config config.json\"",
+    "config": {
+        "files": "{}",
+        "startup": "{\r\n    \"done\": \"Listening on http://\"\r\n}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\nchmod +x bot-app 2>/dev/null || true\n",
+            "container": "ghcr.io/pterodactyl/yolks:debian",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": []
+}

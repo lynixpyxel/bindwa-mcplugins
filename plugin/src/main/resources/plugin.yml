@@ -1,0 +1,20 @@
+name: BindWA
+version: '${version}'
+main: com.dozzy.BindWAPlugin
+api-version: '1.20'
+author: Dozzy
+description: Hubungkan nomor WhatsApp ke akun Minecraft untuk verifikasi dan reward
+softdepend:
+  - Floodgate
+  - AuthMe
+
+commands:
+  bindwa:
+    description: Hubungkan nomor WhatsApp ke akun Minecraft
+    usage: /bindwa
+    aliases: [wabind, whatsapp]
+
+permissions:
+  bindwa.admin:
+    description: Izin untuk me-reload konfigurasi plugin BindWA
+    default: op

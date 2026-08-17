@@ -1,0 +1,28 @@
+api:
+  base-url: "http://192.168.18.67:3636"
+  token: "DOZZY_GANTENG_ABIEZZZZRAWRRRRR123"
+
+phone:
+  regex: "^62\\d{8,13}$"
+
+otp:
+  cooldown-seconds: 60
+  max-attempts: 5
+
+reward:
+  commands:
+    - "eco give %player% 5000"
+    - "give %player% diamond 3"
+  message: "&aSelamat! Nomor WA berhasil di-bind, reward telah diberikan!"
+
+messages:
+  invalid-format: "&cFormat nomor salah. Gunakan format 628xxxxxxxxx"
+  otp-sent: "&aOTP dikirim! Ketik di chat dalam 5 menit."
+  otp-wrong: "&cOTP salah, sisa percobaan: %attempts%"
+  otp-expired: "&cOTP kadaluarsa, silakan ulangi /bindwa"
+  already-bound: "&eAkunmu sudah terhubung dengan nomor %phone%"
+  phone-taken: "&cNomor ini sudah terdaftar di akun lain."
+  cooldown: "&cMohon tunggu %seconds% detik sebelum meminta OTP kembali."
+  max-attempts: "&cSesi OTP dibatalkan karena melebihi batas percobaan salah."
+  service-unavailable: "&cLayanan WhatsApp sedang tidak tersedia. Silakan coba beberapa saat lagi."
+  cancelled: "&eProses verifikasi WhatsApp dibatalkan."
