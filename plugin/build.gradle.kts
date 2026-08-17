@@ -28,6 +28,7 @@ dependencies {
 
     implementation("net.wesjd:anvilgui:1.10.13-SNAPSHOT")
     implementation("org.xerial:sqlite-jdbc:3.45.1.0")
+    implementation("org.java-websocket:Java-WebSocket:1.5.6")
 
     testCompileOnly("io.papermc.paper:paper-api:1.20.4-R0.1-SNAPSHOT")
     testCompileOnly("org.geysermc.floodgate:api:2.2.2-SNAPSHOT")
@@ -38,9 +39,13 @@ dependencies {
 
 tasks {
     shadowJar {
+        archiveBaseName.set("BindWA")
         archiveClassifier.set("")
+        archiveVersion.set("1.0.0")
+
         relocate("net.wesjd.anvilgui", "com.dozzy.libs.anvilgui")
         relocate("org.sqlite", "com.dozzy.libs.sqlite")
+        relocate("org.java_websocket", "com.dozzy.libs.websocket")
     }
 
     build {

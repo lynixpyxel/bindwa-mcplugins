@@ -1,9 +1,12 @@
 package com.dozzy;
 
+import com.dozzy.bridge.ChatBridgeManager;
 import com.dozzy.command.BindWACommand;
+import com.dozzy.command.ChatBridgeCommand;
 import com.dozzy.config.PluginConfig;
 import com.dozzy.database.DatabaseManager;
 import com.dozzy.http.BotApiClient;
+import com.dozzy.listener.GameBridgeListener;
 import com.dozzy.listener.JavaChatListener;
 import com.dozzy.service.BindingService;
 import com.dozzy.ui.BedrockFormFlow;
@@ -22,6 +25,7 @@ public class BindWAPlugin extends JavaPlugin {
     private BindingService bindingService;
     private JavaAnvilFlow javaAnvilFlow;
     private BedrockFormFlow bedrockFormFlow;
+    private ChatBridgeManager chatBridgeManager;
 
     @Override
     public void onEnable() {
@@ -31,7 +35,7 @@ public class BindWAPlugin extends JavaPlugin {
         saveDefaultConfig();
         reloadPluginConfig();
 
-        // 2. Inisialisasi Database SQLite
+        // 2. Inisialisasi Database SQLite & JSON Sync
         this.databaseManager = new DatabaseManager(getDataFolder(), getLogger());
         try {
             this.databaseManager.initialize();
@@ -51,16 +55,34 @@ public class BindWAPlugin extends JavaPlugin {
         this.javaAnvilFlow.setChatListener(javaChatListener);
         getServer().getPluginManager().registerEvents(javaChatListener, this);
 
-        // 4. Registrasi Command
+        // 4. Inisialisasi Direct WhatsApp Chat Bridge
+        this.chatBridgeManager = new ChatBridgeManager(this, this.pluginConfig, this.botApiClient);
+        this.chatBridgeManager.start();
+
+        GameBridgeListener gameBridgeListener = new GameBridgeListener(this, this.chatBridgeManager);
+        getServer().getPluginManager().registerEvents(gameBridgeListener, this);
+
+        // 5. Registrasi Command
         if (getCommand("bindwa") != null) {
             getCommand("bindwa").setExecutor(new BindWACommand(this, this.bindingService, this.javaAnvilFlow, this.bedrockFormFlow));
         }
 
-        getLogger().info("BindWA Plugin berhasil diaktifkan! (Versi: " + getDescription().getVersion() + ")");
+        ChatBridgeCommand chatBridgeCommand = new ChatBridgeCommand(this.chatBridgeManager);
+        if (getCommand("chat") != null) {
+            getCommand("chat").setExecutor(chatBridgeCommand);
+        }
+        if (getCommand("wa") != null) {
+            getCommand("wa").setExecutor(chatBridgeCommand);
+        }
+
+        getLogger().info("BindWA Plugin + WhatsApp Chat Bridge berhasil diaktifkan! (Versi: " + getDescription().getVersion() + ")");
     }
 
     @Override
     public void onDisable() {
+        if (this.chatBridgeManager != null) {
+            this.chatBridgeManager.stop();
+        }
         if (this.databaseManager != null) {
             this.databaseManager.close();
         }
@@ -71,6 +93,11 @@ public class BindWAPlugin extends JavaPlugin {
     public void reloadPluginConfig() {
         reloadConfig();
         this.pluginConfig = new PluginConfig(getConfig());
+        if (this.chatBridgeManager != null) {
+            this.chatBridgeManager.stop();
+            this.chatBridgeManager = new ChatBridgeManager(this, this.pluginConfig, this.botApiClient);
+            this.chatBridgeManager.start();
+        }
     }
 
     public static BindWAPlugin getInstance() {
@@ -83,5 +110,9 @@ public class BindWAPlugin extends JavaPlugin {
 
     public DatabaseManager getDatabaseManager() {
         return databaseManager;
+    }
+
+    public ChatBridgeManager getChatBridgeManager() {
+        return chatBridgeManager;
     }
 }

@@ -13,8 +13,15 @@ commands:
     description: Hubungkan nomor WhatsApp ke akun Minecraft
     usage: /bindwa
     aliases: [wabind, whatsapp]
+  chat:
+    description: Kirim pesan chat ke grup WhatsApp dan Discord
+    usage: /chat <pesan>
+    aliases: [wa]
 
 permissions:
   bindwa.admin:
-    description: Izin untuk me-reload konfigurasi plugin BindWA
+    description: Izin untuk me-reload konfigurasi plugin BindWA dan unbind data
     default: op
+  bindwa.chat:
+    description: Izin untuk menggunakan perintah /chat dan /wa ke WhatsApp/Discord
+    default: true

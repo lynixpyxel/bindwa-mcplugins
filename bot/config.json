@@ -2,6 +2,16 @@
   "http_port": 3636,
   "http_bind": "0.0.0.0",
   "api_token": "DOZZY_GANTENG_ABIEZZZZRAWRRRRR123",
+  "group_jids": [
+    "6288287243319-1620284343@g.us"
+  ],
+  "server_name": "CSMP Minecraft Server",
+  "command_prefixes": [
+    ".",
+    "!",
+    "#",
+    "?"
+  ],
   "otp_ttl_seconds": 300,
   "otp_cooldown_seconds": 60,
   "otp_max_attempts": 5

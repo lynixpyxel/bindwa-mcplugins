@@ -26,14 +26,28 @@ var (
 	ErrWANotLoggedIn  = errors.New("whatsapp client is not logged in")
 )
 
-type WAClient struct {
-	client     *whatsmeow.Client
-	container  *sqlstore.Container
-	mu         sync.RWMutex
-	isLoggedIn bool
+type ServerStatus struct {
+	Online      bool      `json:"online"`
+	PlayerCount int       `json:"player_count"`
+	MaxPlayers  int       `json:"max_players"`
+	PlayerList  []string  `json:"player_list"`
+	TPS         float64   `json:"tps"`
+	LastUpdated time.Time `json:"last_updated"`
 }
 
-func NewWAClient(ctx context.Context, dbPath string) (*WAClient, error) {
+type WAMessageCallback func(groupJid, sender, pushName, text string)
+
+type WAClient struct {
+	client          *whatsmeow.Client
+	container       *sqlstore.Container
+	config          Config
+	mu              sync.RWMutex
+	isLoggedIn      bool
+	serverStatus    ServerStatus
+	messageCallback WAMessageCallback
+}
+
+func NewWAClient(ctx context.Context, dbPath string, cfg Config) (*WAClient, error) {
 	log := waLog.Stdout("WA-Client", "INFO", true)
 	dbURI := fmt.Sprintf("file:%s?_foreign_keys=on", dbPath)
 	container, err := sqlstore.New(ctx, "sqlite", dbURI, log)
@@ -51,11 +65,36 @@ func NewWAClient(ctx context.Context, dbPath string) (*WAClient, error) {
 	w := &WAClient{
 		client:    client,
 		container: container,
+		config:    cfg,
 	}
 
 	client.AddEventHandler(w.eventHandler)
 
 	return w, nil
+}
+
+func (w *WAClient) SetMessageCallback(cb WAMessageCallback) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.messageCallback = cb
+}
+
+func (w *WAClient) UpdateServerStatus(status ServerStatus) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	status.Online = true
+	status.LastUpdated = time.Now()
+	w.serverStatus = status
+}
+
+func (w *WAClient) GetServerStatus() ServerStatus {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	status := w.serverStatus
+	if time.Since(status.LastUpdated) > 35*time.Second {
+		status.Online = false
+	}
+	return status
 }
 
 func (w *WAClient) eventHandler(rawEvt interface{}) {
@@ -74,14 +113,126 @@ func (w *WAClient) eventHandler(rawEvt interface{}) {
 		fmt.Println("[WA-Client] Disconnected from WhatsApp network. Reconnecting...")
 	case *events.StreamReplaced:
 		fmt.Println("[WA-Client] Stream replaced. Session might be open elsewhere.")
-	default:
-		_ = evt
+	case *events.Message:
+		w.handleIncomingMessage(evt)
 	}
+}
+
+func (w *WAClient) parseCommand(text string) (prefix string, cmd string, args string, isCmd bool) {
+	trimmed := strings.TrimSpace(text)
+	prefixes := w.config.CommandPrefixes
+	if len(prefixes) == 0 {
+		prefixes = []string{".", "!", "#", "?"}
+	}
+
+	for _, p := range prefixes {
+		if strings.HasPrefix(trimmed, p) {
+			withoutPrefix := strings.TrimSpace(strings.TrimPrefix(trimmed, p))
+			parts := strings.SplitN(withoutPrefix, " ", 2)
+			cmdName := strings.ToLower(parts[0])
+			argStr := ""
+			if len(parts) > 1 {
+				argStr = strings.TrimSpace(parts[1])
+			}
+			return p, cmdName, argStr, true
+		}
+	}
+	return "", "", "", false
+}
+
+func (w *WAClient) handleIncomingMessage(evt *events.Message) {
+	if evt.Info.IsFromMe {
+		return
+	}
+
+	chatJID := evt.Info.Chat.String()
+	sender := evt.Info.Sender.User
+	pushName := evt.Info.PushName
+	if pushName == "" {
+		pushName = sender
+	}
+
+	var text string
+	if msg := evt.Message.GetConversation(); msg != "" {
+		text = msg
+	} else if ext := evt.Message.GetExtendedTextMessage(); ext != nil && ext.GetText() != "" {
+		text = ext.GetText()
+	}
+
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+
+	// Parsing command berdasarkan prefix yang diatur (., !, #, ?, dll)
+	prefix, cmd, args, isCmd := w.parseCommand(text)
+	if !isCmd {
+		// Pesan percakapan biasa di grup WA -> TIDAK DI-FORWARD ke Minecraft
+		return
+	}
+
+	switch cmd {
+	case "cekserver", "status", "server", "info":
+		go w.replyServerStatus(evt.Info.Chat)
+
+	case "chat", "mc", "game":
+		if args == "" {
+			_ = w.SendToJID(context.Background(), evt.Info.Chat, fmt.Sprintf("⚠️ Format salah! Gunakan: *%schat <pesan>* (contoh: %schat halo semuanya)", prefix, prefix))
+			return
+		}
+
+		w.mu.RLock()
+		cb := w.messageCallback
+		w.mu.RUnlock()
+
+		if cb != nil {
+			cb(chatJID, sender, pushName, args)
+			fmt.Printf("[WA -> MC] [%s] %s: %s\n", pushName, sender, args)
+
+			// Kirim feedback balasan ke grup WhatsApp
+			replyConfirm := fmt.Sprintf("✅ Pesan dari *%s* berhasil dikirim ke server Minecraft!", pushName)
+			_ = w.SendToJID(context.Background(), evt.Info.Chat, replyConfirm)
+		}
+	}
+}
+
+func (w *WAClient) replyServerStatus(target types.JID) {
+	status := w.GetServerStatus()
+
+	var replyText string
+	if status.Online {
+		playerListStr := "Tidak ada player"
+		if len(status.PlayerList) > 0 {
+			playerListStr = strings.Join(status.PlayerList, ", ")
+		}
+
+		elapsed := time.Since(status.LastUpdated).Round(time.Second)
+		replyText = fmt.Sprintf("🟢 *STATUS SERVER MINECRAFT*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• Status: *ONLINE*\n"+
+			"• Server: *%s*\n"+
+			"• Player: *%d / %d Online*\n"+
+			"• Daftar: %s\n"+
+			"• TPS: *%.2f*\n"+
+			"• Update: *%s lalu*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"_Ketik .chat <pesan> untuk mengirim chat ke in-game._",
+			w.config.ServerName, status.PlayerCount, status.MaxPlayers, playerListStr, status.TPS, elapsed)
+	} else {
+		replyText = fmt.Sprintf("🔴 *STATUS SERVER MINECRAFT*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• Status: *OFFLINE*\n"+
+			"• Server: *%s*\n"+
+			"• Keterangan: Server Minecraft sedang offline / restart.\n"+
+			"━━━━━━━━━━━━━━━━━━━━━",
+			w.config.ServerName)
+	}
+
+	_ = w.SendToJID(context.Background(), target, replyText)
 }
 
 func (w *WAClient) Start(ctx context.Context) error {
 	if w.client.Store.ID == nil {
-		// Device belum pairing, perlu QR scan
 		qrChan, _ := w.client.GetQRChannel(ctx)
 		err := w.client.Connect()
 		if err != nil {
@@ -101,7 +252,6 @@ func (w *WAClient) Start(ctx context.Context) error {
 			}
 		}()
 	} else {
-		// Device sudah pairing sebelumnya
 		err := w.client.Connect()
 		if err != nil {
 			return fmt.Errorf("failed to reconnect: %w", err)
@@ -128,6 +278,13 @@ func (w *WAClient) SendMessage(ctx context.Context, phone, message string) error
 
 	cleanPhone := strings.TrimPrefix(phone, "+")
 	jid := types.NewJID(cleanPhone, types.DefaultUserServer)
+	return w.SendToJID(ctx, jid, message)
+}
+
+func (w *WAClient) SendToJID(ctx context.Context, jid types.JID, message string) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
+	}
 
 	msg := &waProto.Message{
 		Conversation: proto.String(message),
@@ -142,6 +299,35 @@ func (w *WAClient) SendMessage(ctx context.Context, phone, message string) error
 	}
 
 	return nil
+}
+
+func (w *WAClient) SendToGroups(ctx context.Context, message string) int {
+	if !w.IsReady() {
+		return 0
+	}
+
+	successCount := 0
+	for _, rawJid := range w.config.GroupJIDs {
+		cleanJid := strings.TrimSpace(rawJid)
+		if cleanJid == "" {
+			continue
+		}
+
+		var jid types.JID
+		if strings.Contains(cleanJid, "@") {
+			jid, _ = types.ParseJID(cleanJid)
+		} else {
+			jid = types.NewJID(cleanJid, types.GroupServer)
+		}
+
+		if err := w.SendToJID(ctx, jid, message); err == nil {
+			successCount++
+		} else {
+			fmt.Printf("[WA-Client] Gagal kirim ke grup %s: %v\n", cleanJid, err)
+		}
+	}
+
+	return successCount
 }
 
 func (w *WAClient) Disconnect() {

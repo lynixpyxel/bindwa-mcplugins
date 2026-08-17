@@ -26,3 +26,15 @@ messages:
   max-attempts: "&cSesi OTP dibatalkan karena melebihi batas percobaan salah."
   service-unavailable: "&cLayanan WhatsApp sedang tidak tersedia. Silakan coba beberapa saat lagi."
   cancelled: "&eProses verifikasi WhatsApp dibatalkan."
+
+# ====================================================================
+# Konfigurasi Chat Bridge & Notifikasi ke Bot WhatsApp
+# ====================================================================
+chat-bridge:
+  enabled: true
+
+  # Notifikasi Otomatis Event Game ke Grup WhatsApp
+  notifications:
+    ender-dragon: true
+    dragon-egg: true
+    elytra: true

@@ -72,6 +72,22 @@ public class PluginConfig {
         return colorize(msg);
     }
 
+    public boolean isChatBridgeEnabled() {
+        return config.getBoolean("chat-bridge.enabled", true);
+    }
+
+    public boolean isNotificationEnderDragon() {
+        return config.getBoolean("chat-bridge.notifications.ender-dragon", true);
+    }
+
+    public boolean isNotificationDragonEgg() {
+        return config.getBoolean("chat-bridge.notifications.dragon-egg", true);
+    }
+
+    public boolean isNotificationElytra() {
+        return config.getBoolean("chat-bridge.notifications.elytra", true);
+    }
+
     public static String colorize(String message) {
         if (message == null) {
             return "";

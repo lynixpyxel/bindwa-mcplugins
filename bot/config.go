@@ -7,19 +7,25 @@ import (
 )
 
 type Config struct {
-	HTTPPort           int    `json:"http_port"`
-	HTTPBind           string `json:"http_bind"`
-	APIToken           string `json:"api_token"`
-	OTPTTLSeconds      int    `json:"otp_ttl_seconds"`
-	OTPCooldownSeconds int    `json:"otp_cooldown_seconds"`
-	OTPMaxAttempts     int    `json:"otp_max_attempts"`
+	HTTPPort           int      `json:"http_port"`
+	HTTPBind           string   `json:"http_bind"`
+	APIToken           string   `json:"api_token"`
+	GroupJIDs          []string `json:"group_jids"`
+	ServerName         string   `json:"server_name"`
+	CommandPrefixes    []string `json:"command_prefixes"`
+	OTPTTLSeconds      int      `json:"otp_ttl_seconds"`
+	OTPCooldownSeconds int      `json:"otp_cooldown_seconds"`
+	OTPMaxAttempts     int      `json:"otp_max_attempts"`
 }
 
 func DefaultConfig() Config {
 	return Config{
 		HTTPPort:           3636,
-		HTTPBind:           "127.0.0.1",
-		APIToken:           "GANTI_DENGAN_SECRET_RANDOM_SAMA_DENGAN_PLUGIN",
+		HTTPBind:           "0.0.0.0",
+		APIToken:           "DOZZY_GANTENG_ABIEZZZZRAWRRRRR123",
+		GroupJIDs:          []string{"6288287243319-1620284343@g.us"},
+		ServerName:         "CSMP Minecraft Server",
+		CommandPrefixes:    []string{".", "!", "#", "?"},
 		OTPTTLSeconds:      300,
 		OTPCooldownSeconds: 60,
 		OTPMaxAttempts:     5,
@@ -32,7 +38,6 @@ func LoadConfig(path string) (Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Write default config
 			data, marshalErr := json.MarshalIndent(cfg, "", "  ")
 			if marshalErr != nil {
 				return cfg, fmt.Errorf("failed to marshal default config: %w", marshalErr)
@@ -51,10 +56,16 @@ func LoadConfig(path string) (Config, error) {
 	}
 
 	if cfg.HTTPPort <= 0 {
-		cfg.HTTPPort = 8080
+		cfg.HTTPPort = 3636
 	}
 	if cfg.HTTPBind == "" {
-		cfg.HTTPBind = "127.0.0.1"
+		cfg.HTTPBind = "0.0.0.0"
+	}
+	if cfg.ServerName == "" {
+		cfg.ServerName = "CSMP Minecraft Server"
+	}
+	if len(cfg.CommandPrefixes) == 0 {
+		cfg.CommandPrefixes = []string{".", "!", "#", "?"}
 	}
 	if cfg.OTPTTLSeconds <= 0 {
 		cfg.OTPTTLSeconds = 300

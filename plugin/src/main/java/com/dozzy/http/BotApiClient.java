@@ -105,6 +105,72 @@ public class BotApiClient {
                 });
     }
 
+    public CompletableFuture<Boolean> sendGroupChat(String player, String message) {
+        String url = trimTrailingSlash(config.getApiBaseUrl()) + "/send-group-chat";
+        String jsonBody = String.format("{\"player\":\"%s\",\"message\":\"%s\"}", escapeJson(player), escapeJson(message));
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + config.getApiToken())
+                .timeout(Duration.ofSeconds(10))
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(res -> res.statusCode() == 200)
+                .exceptionally(t -> {
+                    logger.log(Level.WARNING, "Gagal kirim group chat ke bot WA: " + t.getMessage());
+                    return false;
+                });
+    }
+
+    public CompletableFuture<Boolean> sendNotification(String title, String message) {
+        String url = trimTrailingSlash(config.getApiBaseUrl()) + "/send-notification";
+        String jsonBody = String.format("{\"title\":\"%s\",\"message\":\"%s\"}", escapeJson(title), escapeJson(message));
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + config.getApiToken())
+                .timeout(Duration.ofSeconds(10))
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(res -> res.statusCode() == 200)
+                .exceptionally(t -> {
+                    logger.log(Level.WARNING, "Gagal kirim notifikasi ke bot WA: " + t.getMessage());
+                    return false;
+                });
+    }
+
+    public CompletableFuture<Boolean> sendServerStatus(int playerCount, int maxPlayers, java.util.List<String> playerList, double tps) {
+        String url = trimTrailingSlash(config.getApiBaseUrl()) + "/server-status";
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"player_count\":").append(playerCount)
+                .append(",\"max_players\":").append(maxPlayers)
+                .append(",\"tps\":").append(String.format(java.util.Locale.US, "%.2f", tps))
+                .append(",\"player_list\":[");
+        for (int i = 0; i < playerList.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(escapeJson(playerList.get(i))).append("\"");
+        }
+        sb.append("]}");
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + config.getApiToken())
+                .timeout(Duration.ofSeconds(5))
+                .POST(HttpRequest.BodyPublishers.ofString(sb.toString()))
+                .build();
+
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(res -> res.statusCode() == 200)
+                .exceptionally(t -> false);
+    }
+
     private String trimTrailingSlash(String url) {
         if (url.endsWith("/")) {
             return url.substring(0, url.length() - 1);

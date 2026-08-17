@@ -3,6 +3,7 @@ module bindwa-bot
 go 1.26.5
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/mdp/qrterminal/v3 v3.2.1
 	go.mau.fi/whatsmeow v0.0.0-20260816113502-fb386f152837
 	google.golang.org/protobuf v1.36.12
