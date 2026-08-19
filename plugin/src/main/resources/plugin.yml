@@ -17,6 +17,13 @@ commands:
     description: Kirim pesan chat ke grup WhatsApp dan Discord
     usage: /chat <pesan>
     aliases: [wa]
+  elytraboard:
+    description: Tampilkan leaderboard elytra pemain
+    usage: /elytraboard
+    aliases: [elytraleaderboard, elytratop]
+  elytracheck:
+    description: Cek total pengambilan elytra pemain tertentu
+    usage: /elytracheck <player>
 
 permissions:
   bindwa.admin:
@@ -25,3 +32,6 @@ permissions:
   bindwa.chat:
     description: Izin untuk menggunakan perintah /chat dan /wa ke WhatsApp/Discord
     default: true
+  elytratracker.admin:
+    description: Izin admin untuk cek data elytra pemain
+    default: op

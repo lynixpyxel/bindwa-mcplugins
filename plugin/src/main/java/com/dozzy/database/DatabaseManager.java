@@ -70,6 +70,30 @@ public class DatabaseManager {
                     timestamp INTEGER
                 );
             """);
+
+            // Tabel elytra_log dan player_elytra_count sesuai elytra-prompt.md
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS elytra_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_uuid TEXT NOT NULL,
+                    owner_uuid TEXT NOT NULL,
+                    owner_name TEXT NOT NULL,
+                    pickup_number INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    world TEXT NOT NULL,
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL
+                );
+            """);
+
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS player_elytra_count (
+                    owner_uuid TEXT PRIMARY KEY,
+                    owner_name TEXT NOT NULL,
+                    total_count INTEGER NOT NULL DEFAULT 0
+                );
+            """);
         }
 
         syncToJson();
@@ -305,6 +329,122 @@ public class DatabaseManager {
 
         } catch (SQLException e) {
             logger.log(Level.WARNING, "Gagal sinkronisasi data ke bindings.json: " + e.getMessage());
+        }
+    }
+
+    public record ElytraLeaderboardEntry(String name, int count) {}
+
+    public synchronized int incrementAndGetElytraCount(UUID ownerUuid, String ownerName) {
+        String upsertSql = """
+            INSERT INTO player_elytra_count (owner_uuid, owner_name, total_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(owner_uuid) DO UPDATE SET
+                owner_name = excluded.owner_name,
+                total_count = total_count + 1;
+        """;
+        try (PreparedStatement ps = getConnection().prepareStatement(upsertSql)) {
+            ps.setString(1, ownerUuid.toString());
+            ps.setString(2, ownerName);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal increment elytra count untuk " + ownerName, e);
+        }
+
+        return getPlayerElytraCount(ownerUuid);
+    }
+
+    public synchronized int getPlayerElytraCount(UUID ownerUuid) {
+        String sql = "SELECT total_count FROM player_elytra_count WHERE owner_uuid = ?";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, ownerUuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getInt("total_count");
+                }
+            }
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mengambil elytra count untuk UUID: " + ownerUuid, e);
+        }
+        return 0;
+    }
+
+    public synchronized int decrementElytraCount(UUID ownerUuid) {
+        String sql = "UPDATE player_elytra_count SET total_count = MAX(0, total_count - 1) WHERE owner_uuid = ?";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, ownerUuid.toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal decrement elytra count untuk UUID: " + ownerUuid, e);
+        }
+        return getPlayerElytraCount(ownerUuid);
+    }
+
+    public synchronized String getPlayerNameByUuid(UUID uuid) {
+        String sql = "SELECT owner_name FROM player_elytra_count WHERE owner_uuid = ?";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("owner_name");
+                }
+            }
+        } catch (SQLException ignored) {}
+        return "Player";
+    }
+
+    public synchronized void logElytraPickup(UUID itemUuid, UUID ownerUuid, String ownerName, int pickupNumber, String world, int x, int y, int z) {
+        long now = System.currentTimeMillis();
+        String sql = "INSERT INTO elytra_log (item_uuid, owner_uuid, owner_name, pickup_number, timestamp, world, x, y, z) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, itemUuid.toString());
+            ps.setString(2, ownerUuid.toString());
+            ps.setString(3, ownerName);
+            ps.setInt(4, pickupNumber);
+            ps.setLong(5, now);
+            ps.setString(6, world);
+            ps.setInt(7, x);
+            ps.setInt(8, y);
+            ps.setInt(9, z);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            logger.log(Level.WARNING, "Gagal menulis log pickup elytra untuk " + ownerName, e);
+        }
+    }
+
+    public synchronized List<ElytraLeaderboardEntry> getElytraLeaderboard(int limit) {
+        List<ElytraLeaderboardEntry> list = new ArrayList<>();
+        String sql = "SELECT owner_name, total_count FROM player_elytra_count ORDER BY total_count DESC LIMIT ?";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setInt(1, Math.max(1, limit));
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    list.add(new ElytraLeaderboardEntry(rs.getString("owner_name"), rs.getInt("total_count")));
+                }
+            }
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mengambil leaderboard elytra", e);
+        }
+        return list;
+    }
+
+    public synchronized void resetAllElytraLeaderboard() {
+        try (Statement stmt = getConnection().createStatement()) {
+            stmt.execute("DELETE FROM player_elytra_count;");
+            stmt.execute("DELETE FROM elytra_log;");
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mereset semua leaderboard elytra", e);
+        }
+    }
+
+    public synchronized void resetPlayerElytra(UUID ownerUuid) {
+        try (PreparedStatement ps1 = getConnection().prepareStatement("DELETE FROM player_elytra_count WHERE owner_uuid = ?");
+             PreparedStatement ps2 = getConnection().prepareStatement("DELETE FROM elytra_log WHERE owner_uuid = ?")) {
+            ps1.setString(1, ownerUuid.toString());
+            ps1.executeUpdate();
+            ps2.setString(1, ownerUuid.toString());
+            ps2.executeUpdate();
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mereset elytra untuk UUID: " + ownerUuid, e);
         }
     }
 
