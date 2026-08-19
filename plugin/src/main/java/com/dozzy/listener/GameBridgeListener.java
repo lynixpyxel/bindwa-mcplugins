@@ -6,6 +6,7 @@ import com.dozzy.config.PluginConfig;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.entity.EnderDragon;
+import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -13,10 +14,14 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerAdvancementDoneEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.inventory.ItemStack;
 
-import java.util.Set;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class GameBridgeListener implements Listener {
@@ -25,7 +30,8 @@ public class GameBridgeListener implements Listener {
     private final ChatBridgeManager manager;
     private final PluginConfig config;
 
-    private final Set<String> loggedElytras = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, Long> elytraCooldowns = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> eggCooldowns = new ConcurrentHashMap<>();
 
     public GameBridgeListener(BindWAPlugin plugin, ChatBridgeManager manager) {
         this.plugin = plugin;
@@ -55,31 +61,51 @@ public class GameBridgeListener implements Listener {
             }
 
             manager.sendChatMessage(player.getName(), chatContent);
-            player.sendMessage(PluginConfig.colorize("&aChat dikirim ke grup WhatsApp!"));
+            player.sendMessage(PluginConfig.colorize("&aChat berhasil dikirim ke grup WhatsApp!"));
         }
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onEntityDeath(EntityDeathEvent event) {
         if (!config.isNotificationEnderDragon()) {
             return;
         }
 
-        if (event.getEntity() instanceof EnderDragon) {
-            Player killer = event.getEntity().getKiller();
-            String message;
+        if (event.getEntity() instanceof EnderDragon dragon) {
+            Player killer = dragon.getKiller();
+            String killerName;
+
             if (killer != null) {
-                message = "Ender Dragon telah dibunuh oleh *" + killer.getName() + "*!";
+                killerName = killer.getName();
             } else {
-                message = "Ender Dragon berhasil dikalahkan!";
+                // Cari player terdekat di The End jika killer tidak langsung terdeteksi
+                killerName = dragon.getWorld().getPlayers().stream()
+                        .min(Comparator.comparingDouble(p -> p.getLocation().distanceSquared(dragon.getLocation())))
+                        .map(Player::getName)
+                        .orElse("Player");
             }
 
-            manager.sendNotification("Ender Dragon Death", message);
+            String message = "*Ender Dragon* telah berhasil dikalahkan oleh *" + killerName + "*!";
+            manager.sendNotification("Ender Dragon Defeated", message);
             plugin.getLogger().info("[Game-Bridge] Notifikasi Ender Dragon dikirim: " + message);
         }
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onAdvancementDone(PlayerAdvancementDoneEvent event) {
+        if (!config.isNotificationElytra()) {
+            return;
+        }
+
+        String advKey = event.getAdvancement().getKey().toString();
+        // Advancement perolehan Elytra: minecraft:end/elytra
+        if ("minecraft:end/elytra".equalsIgnoreCase(advKey)) {
+            Player player = event.getPlayer();
+            handleElytraObtained(player);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerInteract(PlayerInteractEvent event) {
         if (!config.isNotificationDragonEgg()) {
             return;
@@ -88,14 +114,29 @@ public class GameBridgeListener implements Listener {
         Player player = event.getPlayer();
         if (player.getWorld().getEnvironment() == World.Environment.THE_END) {
             if (event.getClickedBlock() != null && event.getClickedBlock().getType() == Material.DRAGON_EGG) {
-                String message = "Dragon Egg disentuh/diambil oleh *" + player.getName() + "*!";
-                manager.sendNotification("Dragon Egg Taken", message);
-                plugin.getLogger().info("[Game-Bridge] Notifikasi Dragon Egg dikirim untuk " + player.getName());
+                handleDragonEggTaken(player);
             }
         }
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerInteractEntity(PlayerInteractEntityEvent event) {
+        if (!config.isNotificationElytra()) {
+            return;
+        }
+
+        Player player = event.getPlayer();
+        if (player.getWorld().getEnvironment() == World.Environment.THE_END) {
+            if (event.getRightClicked() instanceof ItemFrame itemFrame) {
+                ItemStack item = itemFrame.getItem();
+                if (item.getType() == Material.ELYTRA) {
+                    handleElytraObtained(player);
+                }
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onItemPickup(EntityPickupItemEvent event) {
         if (!(event.getEntity() instanceof Player player)) {
             return;
@@ -103,21 +144,42 @@ public class GameBridgeListener implements Listener {
 
         ItemStack item = event.getItem().getItemStack();
 
-        // Notifikasi Dragon Egg jika diambil dari ground
+        // Notifikasi Dragon Egg
         if (config.isNotificationDragonEgg() && item.getType() == Material.DRAGON_EGG && player.getWorld().getEnvironment() == World.Environment.THE_END) {
-            String message = "Dragon Egg diambil oleh *" + player.getName() + "*!";
-            manager.sendNotification("Dragon Egg Taken", message);
-            plugin.getLogger().info("[Game-Bridge] Notifikasi Dragon Egg Pickup dikirim untuk " + player.getName());
+            handleDragonEggTaken(player);
         }
 
-        // Notifikasi Elytra jika diambil di The End
+        // Notifikasi Elytra
         if (config.isNotificationElytra() && item.getType() == Material.ELYTRA && player.getWorld().getEnvironment() == World.Environment.THE_END) {
-            String itemKey = player.getUniqueId().toString() + "_" + System.currentTimeMillis() / 10000L;
-            if (loggedElytras.add(itemKey)) {
-                String message = "*" + player.getName() + "* mendapatkan *Elytra*!";
-                manager.sendNotification("Elytra Obtained", message);
-                plugin.getLogger().info("[Game-Bridge] Notifikasi Elytra dikirim untuk " + player.getName());
-            }
+            handleElytraObtained(player);
+        }
+    }
+
+    private void handleElytraObtained(Player player) {
+        UUID uuid = player.getUniqueId();
+        long now = System.currentTimeMillis();
+        Long last = elytraCooldowns.get(uuid);
+
+        // Cooldown 5 menit per player agar tidak spam jika elytra dilepas-pasang
+        if (last == null || now - last > 300_000L) {
+            elytraCooldowns.put(uuid, now);
+            String message = "*" + player.getName() + "* berhasil mendapatkan *Elytra* di The End!";
+            manager.sendNotification("Elytra Obtained", message);
+            plugin.getLogger().info("[Game-Bridge] Notifikasi Elytra dikirim untuk " + player.getName());
+        }
+    }
+
+    private void handleDragonEggTaken(Player player) {
+        UUID uuid = player.getUniqueId();
+        long now = System.currentTimeMillis();
+        Long last = eggCooldowns.get(uuid);
+
+        // Cooldown 2 menit per player
+        if (last == null || now - last > 120_000L) {
+            eggCooldowns.put(uuid, now);
+            String message = "*Dragon Egg* telah diambil/disentuh oleh *" + player.getName() + "*!";
+            manager.sendNotification("Dragon Egg Taken", message);
+            plugin.getLogger().info("[Game-Bridge] Notifikasi Dragon Egg dikirim untuk " + player.getName());
         }
     }
 }

@@ -13,6 +13,7 @@ type Config struct {
 	GroupJIDs          []string `json:"group_jids"`
 	ServerName         string   `json:"server_name"`
 	CommandPrefixes    []string `json:"command_prefixes"`
+	OwnerNumber        string   `json:"owner_number"`
 	OTPTTLSeconds      int      `json:"otp_ttl_seconds"`
 	OTPCooldownSeconds int      `json:"otp_cooldown_seconds"`
 	OTPMaxAttempts     int      `json:"otp_max_attempts"`
@@ -26,6 +27,7 @@ func DefaultConfig() Config {
 		GroupJIDs:          []string{"6288287243319-1620284343@g.us"},
 		ServerName:         "CSMP Minecraft Server",
 		CommandPrefixes:    []string{".", "!", "#", "?"},
+		OwnerNumber:        "6285294959195",
 		OTPTTLSeconds:      300,
 		OTPCooldownSeconds: 60,
 		OTPMaxAttempts:     5,
@@ -38,11 +40,7 @@ func LoadConfig(path string) (Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			data, marshalErr := json.MarshalIndent(cfg, "", "  ")
-			if marshalErr != nil {
-				return cfg, fmt.Errorf("failed to marshal default config: %w", marshalErr)
-			}
-			if writeErr := os.WriteFile(path, data, 0600); writeErr != nil {
+			if writeErr := SaveConfig(path, cfg); writeErr != nil {
 				return cfg, fmt.Errorf("failed to write default config: %w", writeErr)
 			}
 			return cfg, nil
@@ -67,6 +65,9 @@ func LoadConfig(path string) (Config, error) {
 	if len(cfg.CommandPrefixes) == 0 {
 		cfg.CommandPrefixes = []string{".", "!", "#", "?"}
 	}
+	if cfg.OwnerNumber == "" {
+		cfg.OwnerNumber = "6285294959195"
+	}
 	if cfg.OTPTTLSeconds <= 0 {
 		cfg.OTPTTLSeconds = 300
 	}
@@ -78,4 +79,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func SaveConfig(path string, cfg Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return os.WriteFile(path, data, 0644)
 }

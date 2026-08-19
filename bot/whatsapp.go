@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 var (
 	ErrWANotConnected = errors.New("whatsapp client is not connected")
 	ErrWANotLoggedIn  = errors.New("whatsapp client is not logged in")
+	phoneRegexDigits  = regexp.MustCompile(`\d{9,16}`)
 )
 
 type ServerStatus struct {
@@ -35,19 +37,24 @@ type ServerStatus struct {
 	LastUpdated time.Time `json:"last_updated"`
 }
 
-type WAMessageCallback func(groupJid, sender, pushName, text string)
+type WAMessageCallback func(groupJid, groupName, sender, pushName, text string) bool
 
 type WAClient struct {
 	client          *whatsmeow.Client
 	container       *sqlstore.Container
 	config          Config
+	configPath      string
 	mu              sync.RWMutex
 	isLoggedIn      bool
 	serverStatus    ServerStatus
 	messageCallback WAMessageCallback
+	groupNames      map[string]string
+	groupMu         sync.RWMutex
+	rulesManager    *RulesManager
+	warnManager     *WarnManager
 }
 
-func NewWAClient(ctx context.Context, dbPath string, cfg Config) (*WAClient, error) {
+func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath string) (*WAClient, error) {
 	log := waLog.Stdout("WA-Client", "INFO", true)
 	dbURI := fmt.Sprintf("file:%s?_foreign_keys=on", dbPath)
 	container, err := sqlstore.New(ctx, "sqlite", dbURI, log)
@@ -63,9 +70,13 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config) (*WAClient, err
 	client := whatsmeow.NewClient(deviceStore, log)
 
 	w := &WAClient{
-		client:    client,
-		container: container,
-		config:    cfg,
+		client:       client,
+		container:    container,
+		config:       cfg,
+		configPath:   configPath,
+		groupNames:   make(map[string]string),
+		rulesManager: NewRulesManager("group_rules.json"),
+		warnManager:  NewWarnManager("group_warns.json"),
 	}
 
 	client.AddEventHandler(w.eventHandler)
@@ -97,6 +108,42 @@ func (w *WAClient) GetServerStatus() ServerStatus {
 	return status
 }
 
+func (w *WAClient) GetGroupName(jid types.JID) string {
+	jidStr := jid.String()
+	w.groupMu.RLock()
+	if name, exists := w.groupNames[jidStr]; exists && name != "" {
+		w.groupMu.RUnlock()
+		return name
+	}
+	w.groupMu.RUnlock()
+
+	if !w.IsReady() {
+		return "Grup WA"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	info, err := w.client.GetGroupInfo(ctx, jid)
+	if err == nil && info != nil && info.Name != "" {
+		w.groupMu.Lock()
+		w.groupNames[jidStr] = info.Name
+		w.groupMu.Unlock()
+		return info.Name
+	}
+
+	return "Grup WA"
+}
+
+func (w *WAClient) isGroupLinked(groupJID string) bool {
+	for _, j := range w.config.GroupJIDs {
+		if strings.EqualFold(strings.TrimSpace(j), groupJID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *WAClient) eventHandler(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.LoggedOut:
@@ -113,8 +160,55 @@ func (w *WAClient) eventHandler(rawEvt interface{}) {
 		fmt.Println("[WA-Client] Disconnected from WhatsApp network. Reconnecting...")
 	case *events.StreamReplaced:
 		fmt.Println("[WA-Client] Stream replaced. Session might be open elsewhere.")
+	case *events.GroupInfo:
+		w.handleGroupParticipantsChange(evt)
 	case *events.Message:
 		w.handleIncomingMessage(evt)
+	}
+}
+
+func (w *WAClient) handleGroupParticipantsChange(evt *events.GroupInfo) {
+	chatJID := evt.JID.String()
+
+	// Cek apakah grup terhubung ke bot
+	if !w.isGroupLinked(chatJID) {
+		return
+	}
+
+	groupName := w.GetGroupName(evt.JID)
+
+	// 1. Sambutan Member Baru Join
+	if len(evt.Join) > 0 {
+		for _, member := range evt.Join {
+			mentionTag := "@" + member.User
+			welcomeText := fmt.Sprintf("👋 *SELAMAT DATANG!*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"Halo %s! Selamat datang di grup *%s* 🎉\n\n"+
+				"📌 Ketik *.rules* untuk membaca peraturan grup.\n"+
+				"🎮 Ketik *.cekserver* untuk cek status server Minecraft.\n"+
+				"💬 Ketik *.chat <pesan>* untuk kirim chat ke in-game.\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"_Selamat bergabung dan enjoy bermain!_",
+				mentionTag, groupName)
+
+			_ = w.SendWithMentions(context.Background(), evt.JID, welcomeText, []string{member.String()})
+			fmt.Printf("[WA-Welcome] Member %s joined %s\n", member.User, groupName)
+		}
+	}
+
+	// 2. Notifikasi Member Keluar / Leave
+	if len(evt.Leave) > 0 {
+		for _, member := range evt.Leave {
+			mentionTag := "@" + member.User
+			goodbyeText := fmt.Sprintf("👋 *SELAMAT TINGGAL!*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"%s telah keluar dari grup *%s*. Sampai jumpa lagi! ✨\n"+
+				"━━━━━━━━━━━━━━━━━━━━━",
+				mentionTag, groupName)
+
+			_ = w.SendWithMentions(context.Background(), evt.JID, goodbyeText, []string{member.String()})
+			fmt.Printf("[WA-Goodbye] Member %s left %s\n", member.User, groupName)
+		}
 	}
 }
 
@@ -140,18 +234,164 @@ func (w *WAClient) parseCommand(text string) (prefix string, cmd string, args st
 	return "", "", "", false
 }
 
-func (w *WAClient) handleIncomingMessage(evt *events.Message) {
+func cleanPhone(phone string) string {
+	phone = strings.TrimPrefix(phone, "+")
+	phone = strings.TrimPrefix(phone, "0")
+	return strings.TrimSpace(phone)
+}
+
+func isPhoneMatch(p1, p2 string) bool {
+	c1 := cleanPhone(p1)
+	c2 := cleanPhone(p2)
+	if c1 == "" || c2 == "" {
+		return false
+	}
+	if c1 == c2 {
+		return true
+	}
+	if strings.HasSuffix(c1, c2) || strings.HasSuffix(c2, c1) {
+		return true
+	}
+	return false
+}
+
+func (w *WAClient) resolveSenderPhone(evt *events.Message) string {
+	// 1. Cek SenderAlt jika ada nomor HP
+	if !evt.Info.SenderAlt.IsEmpty() && evt.Info.SenderAlt.Server == types.DefaultUserServer {
+		return evt.Info.SenderAlt.User
+	}
+
+	// 2. Cek Sender langsung jika bukan @lid
+	if evt.Info.Sender.Server == types.DefaultUserServer {
+		return evt.Info.Sender.User
+	}
+
+	// 3. Jika sender adalah @lid di grup, cari nomor asli di metadata peserta grup
+	if evt.Info.IsGroup {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		info, err := w.client.GetGroupInfo(ctx, evt.Info.Chat)
+		if err == nil && info != nil {
+			senderJID := evt.Info.Sender
+			for _, p := range info.Participants {
+				if (p.JID == senderJID || p.LID == senderJID) && !p.PhoneNumber.IsEmpty() {
+					return p.PhoneNumber.User
+				}
+			}
+		}
+	}
+
+	return evt.Info.Sender.User
+}
+
+func (w *WAClient) isSenderOwner(evt *events.Message) bool {
+	// 1. Pesan dari akun bot sendiri (jika owner scan QR dengan nomornya)
 	if evt.Info.IsFromMe {
-		return
+		return true
 	}
 
-	chatJID := evt.Info.Chat.String()
-	sender := evt.Info.Sender.User
-	pushName := evt.Info.PushName
-	if pushName == "" {
-		pushName = sender
+	ownerNum := w.config.OwnerNumber
+	if ownerNum == "" {
+		return false
 	}
 
+	// 2. Cek Sender JID
+	if isPhoneMatch(evt.Info.Sender.User, ownerNum) {
+		return true
+	}
+
+	// 3. Cek SenderAlt JID
+	if !evt.Info.SenderAlt.IsEmpty() && isPhoneMatch(evt.Info.SenderAlt.User, ownerNum) {
+		return true
+	}
+
+	// 4. Cek nomor yang di-resolve dari grup metadata
+	resolved := w.resolveSenderPhone(evt)
+	if isPhoneMatch(resolved, ownerNum) {
+		return true
+	}
+
+	return false
+}
+
+func (w *WAClient) IsUserGroupAdmin(ctx context.Context, groupJID types.JID, evt *events.Message) bool {
+	if w.isSenderOwner(evt) {
+		return true
+	}
+
+	info, err := w.client.GetGroupInfo(ctx, groupJID)
+	if err != nil || info == nil {
+		return false
+	}
+
+	senderJID := evt.Info.Sender
+	senderAlt := evt.Info.SenderAlt
+
+	for _, p := range info.Participants {
+		match := (p.JID == senderJID || p.LID == senderJID || p.PhoneNumber == senderJID)
+		if !match && !senderAlt.IsEmpty() {
+			match = (p.JID == senderAlt || p.LID == senderAlt || p.PhoneNumber == senderAlt)
+		}
+		if match && (p.IsAdmin || p.IsSuperAdmin) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *WAClient) IsBotGroupAdmin(ctx context.Context, groupJID types.JID) bool {
+	if w.client.Store.ID == nil {
+		return false
+	}
+	botUser := w.client.Store.ID.User
+
+	info, err := w.client.GetGroupInfo(ctx, groupJID)
+	if err != nil || info == nil {
+		return false
+	}
+
+	for _, p := range info.Participants {
+		if (p.JID.User == botUser || p.PhoneNumber.User == botUser) && (p.IsAdmin || p.IsSuperAdmin) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *WAClient) extractTargetUser(evt *events.Message, args string) (types.JID, string) {
+	ctxInfo := evt.Message.GetExtendedTextMessage().GetContextInfo()
+
+	// 1. Cek dari mentions (@user)
+	if ctxInfo != nil && len(ctxInfo.GetMentionedJID()) > 0 {
+		targetStr := ctxInfo.GetMentionedJID()[0]
+		targetJID, _ := types.ParseJID(targetStr)
+		// Bersihkan mention dari args untuk alasan
+		reason := args
+		for _, m := range ctxInfo.GetMentionedJID() {
+			userNum := strings.Split(m, "@")[0]
+			reason = strings.ReplaceAll(reason, "@"+userNum, "")
+		}
+		return targetJID, strings.TrimSpace(reason)
+	}
+
+	// 2. Cek dari pesan yang di-reply/quote
+	if ctxInfo != nil && ctxInfo.GetParticipant() != "" {
+		targetJID, _ := types.ParseJID(ctxInfo.GetParticipant())
+		return targetJID, strings.TrimSpace(args)
+	}
+
+	// 3. Cek dari nomor telepon di argumen
+	matches := phoneRegexDigits.FindStringSubmatch(args)
+	if len(matches) > 0 {
+		targetJID := types.NewJID(matches[0], types.DefaultUserServer)
+		reason := strings.TrimSpace(strings.Replace(args, matches[0], "", 1))
+		return targetJID, reason
+	}
+
+	return types.EmptyJID, args
+}
+
+func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	var text string
 	if msg := evt.Message.GetConversation(); msg != "" {
 		text = msg
@@ -164,34 +404,273 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		return
 	}
 
-	// Parsing command berdasarkan prefix yang diatur (., !, #, ?, dll)
 	prefix, cmd, args, isCmd := w.parseCommand(text)
 	if !isCmd {
-		// Pesan percakapan biasa di grup WA -> TIDAK DI-FORWARD ke Minecraft
+		// Pesan bukan command -> jika bukan command atau dari bot sendiri, abaikan
 		return
 	}
+
+	chatJID := evt.Info.Chat.String()
+	senderPhone := w.resolveSenderPhone(evt)
+	pushName := evt.Info.PushName
+	if pushName == "" {
+		pushName = senderPhone
+	}
+
+	ctx := context.Background()
 
 	switch cmd {
 	case "cekserver", "status", "server", "info":
 		go w.replyServerStatus(evt.Info.Chat)
 
+	case "rules", "rule", "peraturan":
+		groupName := w.GetGroupName(evt.Info.Chat)
+		rulesText := w.rulesManager.GetRules(chatJID)
+		replyMsg := fmt.Sprintf("📜 *PERATURAN & RULES: %s*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"%s\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"_Patuhi rules untuk kenyamanan bersama._",
+			groupName, rulesText)
+		_ = w.SendToJID(ctx, evt.Info.Chat, replyMsg)
+
+	case "setrules", "editrules":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Hanya Admin grup atau Owner bot yang dapat mengatur rules.")
+			return
+		}
+
+		if strings.TrimSpace(args) == "" {
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("⚠️ Format salah! Gunakan: *%ssetrules <isi rules baru>*", prefix))
+			return
+		}
+
+		_ = w.rulesManager.SetRules(chatJID, args)
+		groupName := w.GetGroupName(evt.Info.Chat)
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("✅ *Rules Berhasil Diperbarui untuk Grup %s!*\nKetik *%srules* untuk melihat peraturan terbaru.", groupName, prefix))
+
+	case "warn", "warning":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Hanya Admin grup atau Owner bot yang dapat memberikan peringatan.")
+			return
+		}
+
+		targetJID, reason := w.extractTargetUser(evt, args)
+		if targetJID.IsEmpty() {
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("⚠️ Tag atau reply user yang ingin di-warn!\nContoh: *%swarn @user toxic*", prefix))
+			return
+		}
+
+		// Cegah warn terhadap bot sendiri atau owner
+		if (w.client.Store.ID != nil && targetJID.User == w.client.Store.ID.User) || isPhoneMatch(targetJID.User, w.config.OwnerNumber) {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Tidak dapat memberikan peringatan kepada Bot atau Owner.")
+			return
+		}
+
+		if reason == "" {
+			reason = "Melanggar peraturan grup"
+		}
+
+		warnCount := w.warnManager.AddWarn(chatJID, targetJID.User)
+
+		if warnCount < 3 {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "⚠️")
+			warnMsg := fmt.Sprintf("⚠️ *PERINGATAN DIBERIKAN! [%d/3]*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"• Target: @%s\n"+
+				"• Oleh Admin: @%s\n"+
+				"• Alasan: *%s*\n"+
+				"• Status Warn: *[%d/3]*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"_Maksimal peringatan adalah 3x. Jika mencapai 3x akan otomatis dikeluarkan dari grup._",
+				warnCount, targetJID.User, senderPhone, reason, warnCount)
+
+			_ = w.SendWithMentions(ctx, evt.Info.Chat, warnMsg, []string{targetJID.String(), evt.Info.Sender.String()})
+		} else {
+			// Batas 3x tercapai -> Kick user
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "🚫")
+
+			isBotAdmin := w.IsBotGroupAdmin(ctx, evt.Info.Chat)
+			if isBotAdmin {
+				_, kickErr := w.client.UpdateGroupParticipants(ctx, evt.Info.Chat, []types.JID{targetJID}, whatsmeow.ParticipantChangeRemove)
+				if kickErr == nil {
+					w.warnManager.ResetWarn(chatJID, targetJID.User)
+					kickMsg := fmt.Sprintf("🚫 *BATAS PERINGATAN [3/3] TERCAPAI!*\n"+
+						"━━━━━━━━━━━━━━━━━━━━━\n"+
+						"• Target: @%s\n"+
+						"• Alasan: *%s*\n"+
+						"• Tindakan: *Dikeluarkan dari grup (Kick)* 🚪\n"+
+						"━━━━━━━━━━━━━━━━━━━━━",
+						targetJID.User, reason)
+					_ = w.SendWithMentions(ctx, evt.Info.Chat, kickMsg, []string{targetJID.String()})
+					return
+				}
+			}
+
+			// Jika bot bukan admin
+			alertMsg := fmt.Sprintf("🚫 *BATAS PERINGATAN [3/3] TERCAPAI!*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"• Target: @%s\n"+
+				"• Alasan: *%s*\n"+
+				"• Status: *Telah mencapai 3x peringatan!*\n"+
+				"• Catatan: _Bot bukan admin grup. Mohon Admin mengeluarkan user ini._\n"+
+				"━━━━━━━━━━━━━━━━━━━━━",
+				targetJID.User, reason)
+			_ = w.SendWithMentions(ctx, evt.Info.Chat, alertMsg, []string{targetJID.String()})
+		}
+
+	case "resetwarn", "unwarn", "clearwarn":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Hanya Admin grup atau Owner bot yang dapat me-reset peringatan.")
+			return
+		}
+
+		targetJID, _ := w.extractTargetUser(evt, args)
+		if targetJID.IsEmpty() {
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("⚠️ Tag atau reply user yang ingin di-reset warn!\nContoh: *%sresetwarn @user*", prefix))
+			return
+		}
+
+		w.warnManager.ResetWarn(chatJID, targetJID.User)
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		resetMsg := fmt.Sprintf("✅ *PERINGATAN DI-RESET! [0/3]*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• Target: @%s\n"+
+			"• Oleh Admin: @%s\n"+
+			"• Status Peringatan: *[0/3] (Bersih)*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━",
+			targetJID.User, senderPhone)
+		_ = w.SendWithMentions(ctx, evt.Info.Chat, resetMsg, []string{targetJID.String(), evt.Info.Sender.String()})
+
+	case "cekwarn", "warns", "mywarn":
+		targetJID, _ := w.extractTargetUser(evt, args)
+		if targetJID.IsEmpty() {
+			targetJID = evt.Info.Sender
+		}
+
+		count := w.warnManager.GetWarn(chatJID, targetJID.User)
+		cekMsg := fmt.Sprintf("📋 *STATUS PERINGATAN*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• User: @%s\n"+
+			"• Jumlah Warn: *[%d/3]*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━",
+			targetJID.User, count)
+		_ = w.SendWithMentions(ctx, evt.Info.Chat, cekMsg, []string{targetJID.String()})
+
+	case "linkthisgroup", "linkgroup", "addgroup":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.isSenderOwner(evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Perintah ini hanya bisa dipanggil oleh Owner bot (Nomor: "+w.config.OwnerNumber+").")
+			return
+		}
+
+		alreadyLinked := false
+		for _, j := range w.config.GroupJIDs {
+			if strings.EqualFold(strings.TrimSpace(j), chatJID) {
+				alreadyLinked = true
+				break
+			}
+		}
+
+		groupName := w.GetGroupName(evt.Info.Chat)
+
+		if !alreadyLinked {
+			w.config.GroupJIDs = append(w.config.GroupJIDs, chatJID)
+			if w.configPath != "" {
+				_ = SaveConfig(w.configPath, w.config)
+			}
+		}
+
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		replyMsg := fmt.Sprintf("✅ *Grup Berhasil Dihubungkan ke Minecraft!*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• Nama Grup: *%s*\n"+
+			"• JID: `%s`\n"+
+			"• Status: *Aktif & Tersimpan*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"_Anggota grup ini sekarang dapat menggunakan perintah %schat <pesan>, %scekserver, %srules, dan %swarn._",
+			groupName, chatJID, prefix, prefix, prefix, prefix)
+		_ = w.SendToJID(ctx, evt.Info.Chat, replyMsg)
+		fmt.Printf("[WA-Admin] Group linked by owner %s: %s (%s)\n", senderPhone, groupName, chatJID)
+
+	case "unlinkthisgroup", "unlinkgroup":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.isSenderOwner(evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Perintah ini hanya bisa dipanggil oleh Owner bot.")
+			return
+		}
+
+		newGroups := make([]string, 0, len(w.config.GroupJIDs))
+		for _, j := range w.config.GroupJIDs {
+			if !strings.EqualFold(strings.TrimSpace(j), chatJID) {
+				newGroups = append(newGroups, j)
+			}
+		}
+		w.config.GroupJIDs = newGroups
+		if w.configPath != "" {
+			_ = SaveConfig(w.configPath, w.config)
+		}
+
+		groupName := w.GetGroupName(evt.Info.Chat)
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("🔌 Grup *%s* telah diputuskan hubungannya dari server Minecraft.", groupName))
+
 	case "chat", "mc", "game":
 		if args == "" {
-			_ = w.SendToJID(context.Background(), evt.Info.Chat, fmt.Sprintf("⚠️ Format salah! Gunakan: *%schat <pesan>* (contoh: %schat halo semuanya)", prefix, prefix))
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
 			return
+		}
+
+		groupName := "Grup WA"
+		if evt.Info.IsGroup {
+			groupName = w.GetGroupName(evt.Info.Chat)
 		}
 
 		w.mu.RLock()
 		cb := w.messageCallback
 		w.mu.RUnlock()
 
+		success := false
 		if cb != nil {
-			cb(chatJID, sender, pushName, args)
-			fmt.Printf("[WA -> MC] [%s] %s: %s\n", pushName, sender, args)
+			success = cb(chatJID, groupName, senderPhone, pushName, args)
+		}
 
-			// Kirim feedback balasan ke grup WhatsApp
-			replyConfirm := fmt.Sprintf("✅ Pesan dari *%s* berhasil dikirim ke server Minecraft!", pushName)
-			_ = w.SendToJID(context.Background(), evt.Info.Chat, replyConfirm)
+		// Reaksi emoji ke pesan WhatsApp
+		if success {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+			fmt.Printf("[WA -> MC] [%s] %s: %s (Reacted ✅)\n", groupName, pushName, args)
+		} else {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			fmt.Printf("[WA -> MC] Gagal forward pesan dari %s (Server offline / disconnected) (Reacted ❌)\n", senderPhone)
 		}
 	}
 }
@@ -276,8 +755,8 @@ func (w *WAClient) SendMessage(ctx context.Context, phone, message string) error
 		return ErrWANotConnected
 	}
 
-	cleanPhone := strings.TrimPrefix(phone, "+")
-	jid := types.NewJID(cleanPhone, types.DefaultUserServer)
+	cleanPhoneStr := strings.TrimPrefix(phone, "+")
+	jid := types.NewJID(cleanPhoneStr, types.DefaultUserServer)
 	return w.SendToJID(ctx, jid, message)
 }
 
@@ -296,6 +775,44 @@ func (w *WAClient) SendToJID(ctx context.Context, jid types.JID, message string)
 	_, err := w.client.SendMessage(sendCtx, jid, msg)
 	if err != nil {
 		return fmt.Errorf("failed to send wa message: %w", err)
+	}
+
+	return nil
+}
+
+func (w *WAClient) SendWithMentions(ctx context.Context, jid types.JID, message string, mentions []string) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
+	}
+
+	msg := &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String(message),
+			ContextInfo: &waProto.ContextInfo{
+				MentionedJID: mentions,
+			},
+		},
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	_, err := w.client.SendMessage(sendCtx, jid, msg)
+	return err
+}
+
+func (w *WAClient) ReactMessage(chat, sender types.JID, msgID types.MessageID, emoji string) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
+	}
+
+	reactionMsg := w.client.BuildReaction(chat, sender, msgID, emoji)
+	sendCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := w.client.SendMessage(sendCtx, chat, reactionMsg)
+	if err != nil {
+		return fmt.Errorf("failed to react to message: %w", err)
 	}
 
 	return nil

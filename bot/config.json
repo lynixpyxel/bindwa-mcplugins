@@ -12,6 +12,7 @@
     "#",
     "?"
   ],
+  "owner_number": "6285294959195",
   "otp_ttl_seconds": 300,
   "otp_cooldown_seconds": 60,
   "otp_max_attempts": 5

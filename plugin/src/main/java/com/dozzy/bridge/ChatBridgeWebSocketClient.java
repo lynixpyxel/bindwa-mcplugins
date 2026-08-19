@@ -38,14 +38,14 @@ public class ChatBridgeWebSocketClient extends WebSocketClient {
 
             String type = json.get("type").getAsString();
             if ("chat_wa".equals(type)) {
+                String groupName = json.has("group_name") ? json.get("group_name").getAsString() : "Grup WA";
                 String pushName = json.has("push_name") ? json.get("push_name").getAsString() : "Anon";
                 String sender = json.has("sender") ? json.get("sender").getAsString() : "";
                 String text = json.has("text") ? json.get("text").getAsString() : "";
 
-                String formattedMsg = "§b|§aGrup WA§b| <§a" + pushName + "§b> (§a" + sender + "§b):§r " + text
-                        + "\n§6§otulis '/chat <pesan>' untuk membalas ke grup WhatsApp";
+                String formattedMsg = "§b|§a" + groupName + "§b| <§a" + pushName + "§b>:§r " + text;
 
-                plugin.getLogger().info("[WA -> MC] " + pushName + ": " + text);
+                plugin.getLogger().info("[WA -> MC] [" + groupName + "] " + pushName + ": " + text);
 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     Bukkit.broadcastMessage(formattedMsg);

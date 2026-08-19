@@ -55,7 +55,7 @@ func main() {
 	var waClient *WAClient
 	if !*dryRun {
 		var waErr error
-		waClient, waErr = NewWAClient(ctx, "whatsapp_session.db", cfg)
+		waClient, waErr = NewWAClient(ctx, "whatsapp_session.db", cfg, *configPath)
 		if waErr != nil {
 			log.Fatalf("Failed to initialize WhatsApp client: %v", waErr)
 		}

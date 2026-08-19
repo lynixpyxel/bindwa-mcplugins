@@ -67,35 +67,46 @@ func NewServer(cfg Config, otpStore *OTPStore, waClient *WAClient) *Server {
 	}
 
 	if waClient != nil {
-		waClient.SetMessageCallback(func(groupJid, sender, pushName, text string) {
-			s.broadcastGroupChatToWS(groupJid, sender, pushName, text)
+		waClient.SetMessageCallback(func(groupJid, groupName, sender, pushName, text string) bool {
+			return s.broadcastGroupChatToWS(groupJid, groupName, sender, pushName, text)
 		})
 	}
 
 	return s
 }
 
-func (s *Server) broadcastGroupChatToWS(groupJid, sender, pushName, text string) {
+func (s *Server) broadcastGroupChatToWS(groupJid, groupName, sender, pushName, text string) bool {
 	data, err := json.Marshal(map[string]interface{}{
 		"type":        "chat_wa",
 		"group":       groupJid,
+		"group_name":  groupName,
 		"sender":      sender,
 		"push_name":   pushName,
 		"text":        text,
 		"server_name": s.cfg.ServerName,
 	})
 	if err != nil {
-		return
+		return false
 	}
 
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
+
+	if len(s.wsClients) == 0 {
+		return false
+	}
+
+	sentCount := 0
 	for conn := range s.wsClients {
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			_ = conn.Close()
 			delete(s.wsClients, conn)
+		} else {
+			sentCount++
 		}
 	}
+
+	return sentCount > 0
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {

@@ -46,6 +46,39 @@ public class BindWACommand implements CommandExecutor {
                 return true;
             }
 
+            if (args[0].equalsIgnoreCase("testnotif")) {
+                if (!sender.hasPermission("bindwa.admin")) {
+                    sender.sendMessage(PluginConfig.colorize("&cKamu tidak memiliki izin untuk menggunakan perintah ini."));
+                    return true;
+                }
+                if (args.length < 2) {
+                    sender.sendMessage(PluginConfig.colorize("&cPenggunaan: /bindwa testnotif <dragon|elytra|egg>"));
+                    return true;
+                }
+                String senderName = (sender instanceof Player p) ? p.getName() : "Admin";
+                String type = args[1].toLowerCase();
+
+                switch (type) {
+                    case "dragon", "enderdragon" -> {
+                        String msg = "🐉 *Ender Dragon* telah berhasil dikalahkan oleh *" + senderName + "*! (Test)";
+                        plugin.getChatBridgeManager().sendNotification("Ender Dragon Defeated", msg);
+                        sender.sendMessage(PluginConfig.colorize("&a[BindWA] Test notifikasi Ender Dragon telah dikirim ke grup WhatsApp!"));
+                    }
+                    case "elytra" -> {
+                        String msg = "🪽 *" + senderName + "* berhasil mendapatkan *Elytra* di The End! (Test)";
+                        plugin.getChatBridgeManager().sendNotification("Elytra Obtained", msg);
+                        sender.sendMessage(PluginConfig.colorize("&a[BindWA] Test notifikasi Elytra telah dikirim ke grup WhatsApp!"));
+                    }
+                    case "egg" -> {
+                        String msg = "🥚 *Dragon Egg* telah diambil/disentuh oleh *" + senderName + "*! (Test)";
+                        plugin.getChatBridgeManager().sendNotification("Dragon Egg Taken", msg);
+                        sender.sendMessage(PluginConfig.colorize("&a[BindWA] Test notifikasi Dragon Egg telah dikirim ke grup WhatsApp!"));
+                    }
+                    default -> sender.sendMessage(PluginConfig.colorize("&cPilihan tidak valid: pilih 'dragon', 'elytra', atau 'egg'."));
+                }
+                return true;
+            }
+
             if (args[0].equalsIgnoreCase("unbind") || args[0].equalsIgnoreCase("reset")) {
                 if (!sender.hasPermission("bindwa.admin")) {
                     sender.sendMessage(PluginConfig.colorize("&cKamu tidak memiliki izin untuk menggunakan perintah ini."));
