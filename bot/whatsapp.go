@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -52,6 +54,7 @@ type WAClient struct {
 	groupMu         sync.RWMutex
 	rulesManager    *RulesManager
 	warnManager     *WarnManager
+	welcomeManager  *WelcomeManager
 }
 
 func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath string) (*WAClient, error) {
@@ -70,13 +73,14 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath stri
 	client := whatsmeow.NewClient(deviceStore, log)
 
 	w := &WAClient{
-		client:       client,
-		container:    container,
-		config:       cfg,
-		configPath:   configPath,
-		groupNames:   make(map[string]string),
-		rulesManager: NewRulesManager("group_rules.json"),
-		warnManager:  NewWarnManager("group_warns.json"),
+		client:         client,
+		container:      container,
+		config:         cfg,
+		configPath:     configPath,
+		groupNames:     make(map[string]string),
+		rulesManager:   NewRulesManager("group_rules.json"),
+		warnManager:    NewWarnManager("group_warns.json"),
+		welcomeManager: NewWelcomeManager("group_welcome.json"),
 	}
 
 	client.AddEventHandler(w.eventHandler)
@@ -177,36 +181,34 @@ func (w *WAClient) handleGroupParticipantsChange(evt *events.GroupInfo) {
 
 	groupName := w.GetGroupName(evt.JID)
 
-	// 1. Sambutan Member Baru Join
+	// 1. Sambutan Member Baru Join (Dengan Foto Profil User)
 	if len(evt.Join) > 0 {
 		for _, member := range evt.Join {
-			mentionTag := "@" + member.User
-			welcomeText := fmt.Sprintf("👋 *SELAMAT DATANG!*\n"+
-				"━━━━━━━━━━━━━━━━━━━━━\n"+
-				"Halo %s! Selamat datang di grup *%s* 🎉\n\n"+
-				"📌 Ketik *.rules* untuk membaca peraturan grup.\n"+
-				"🎮 Ketik *.cekserver* untuk cek status server Minecraft.\n"+
-				"💬 Ketik *.chat <pesan>* untuk kirim chat ke in-game.\n"+
-				"━━━━━━━━━━━━━━━━━━━━━\n"+
-				"_Selamat bergabung dan enjoy bermain!_",
-				mentionTag, groupName)
+			template := w.welcomeManager.GetWelcomeTemplate(chatJID)
+			welcomeText := w.welcomeManager.FormatMessage(template, member.User, groupName)
 
-			_ = w.SendWithMentions(context.Background(), evt.JID, welcomeText, []string{member.String()})
-			fmt.Printf("[WA-Welcome] Member %s joined %s\n", member.User, groupName)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			imgBytes := w.fetchUserProfilePicture(ctx, member)
+			cancel()
+
+			var err error
+			if len(imgBytes) > 0 {
+				err = w.SendImageWithMentions(context.Background(), evt.JID, imgBytes, welcomeText, []string{member.String()})
+			}
+			if len(imgBytes) == 0 || err != nil {
+				_ = w.SendWithMentions(context.Background(), evt.JID, welcomeText, []string{member.String()})
+			}
+			fmt.Printf("[WA-Welcome] Member %s joined %s (With Photo: %v)\n", member.User, groupName, len(imgBytes) > 0)
 		}
 	}
 
-	// 2. Notifikasi Member Keluar / Leave
+	// 2. Notifikasi Member Keluar / Leave (Tanpa Foto Sesuai Permintaan)
 	if len(evt.Leave) > 0 {
 		for _, member := range evt.Leave {
-			mentionTag := "@" + member.User
-			goodbyeText := fmt.Sprintf("👋 *SELAMAT TINGGAL!*\n"+
-				"━━━━━━━━━━━━━━━━━━━━━\n"+
-				"%s telah keluar dari grup *%s*. Sampai jumpa lagi! ✨\n"+
-				"━━━━━━━━━━━━━━━━━━━━━",
-				mentionTag, groupName)
+			template := w.welcomeManager.GetLeaveTemplate(chatJID)
+			leaveText := w.welcomeManager.FormatMessage(template, member.User, groupName)
 
-			_ = w.SendWithMentions(context.Background(), evt.JID, goodbyeText, []string{member.String()})
+			_ = w.SendWithMentions(context.Background(), evt.JID, leaveText, []string{member.String()})
 			fmt.Printf("[WA-Goodbye] Member %s left %s\n", member.User, groupName)
 		}
 	}
@@ -426,7 +428,7 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	case "rules", "rule", "peraturan":
 		groupName := w.GetGroupName(evt.Info.Chat)
 		rulesText := w.rulesManager.GetRules(chatJID)
-		replyMsg := fmt.Sprintf("📜 *PERATURAN & RULES: %s*\n"+
+		replyMsg := fmt.Sprintf("*PERATURAN & RULES: %s*\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
 			"%s\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
@@ -454,7 +456,65 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		_ = w.rulesManager.SetRules(chatJID, args)
 		groupName := w.GetGroupName(evt.Info.Chat)
 		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
-		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("✅ *Rules Berhasil Diperbarui untuk Grup %s!*\nKetik *%srules* untuk melihat peraturan terbaru.", groupName, prefix))
+		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("*Rules Berhasil Diperbarui untuk Grup %s!*\nKetik *%srules* untuk melihat peraturan terbaru.", groupName, prefix))
+
+	case "setwelcome", "setwellcome":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Akses ditolak! Hanya Admin grup atau Owner bot yang dapat mengatur pesan welcome.")
+			return
+		}
+
+		if strings.TrimSpace(args) == "" {
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("*Format Salah!*\nGunakan: *%ssetwelcome <teks welcome>*\n\nVariabel yang tersedia:\n• *%%name* : Tag member (@user)\n• *%%groupname* : Nama grup\n• *%%date* : Tanggal join\n• *%%time* : Jam join\n\nContoh: *%ssetwelcome Halo %%name selamat datang di %%groupname!*", prefix, prefix))
+			return
+		}
+
+		_ = w.welcomeManager.SetWelcomeTemplate(chatJID, args)
+		groupName := w.GetGroupName(evt.Info.Chat)
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("✅ *Template Welcome Berhasil Diperbarui untuk Grup %s!*\n\n*Preview:* \n%s", groupName, w.welcomeManager.FormatMessage(args, "user", groupName)))
+
+	case "setgoodbye", "setleave", "setout":
+		if !evt.Info.IsGroup {
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			return
+		}
+
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Akses ditolak! Hanya Admin grup atau Owner bot yang dapat mengatur pesan goodbye.")
+			return
+		}
+
+		if strings.TrimSpace(args) == "" {
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("*Format Salah!*\nGunakan: *%ssetgoodbye <teks goodbye>*\n\nVariabel yang tersedia:\n• *%%name* : Tag member (@user)\n• *%%groupname* : Nama grup\n• *%%date* : Tanggal\n• *%%time* : Jam\n\nContoh: *%ssetgoodbye %%name telah keluar dari %%groupname. Sampai jumpa!*", prefix, prefix))
+			return
+		}
+
+		_ = w.welcomeManager.SetLeaveTemplate(chatJID, args)
+		groupName := w.GetGroupName(evt.Info.Chat)
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("*Template Goodbye Berhasil Diperbarui untuk Grup %s!*\n\n*Preview:* \n%s", groupName, w.welcomeManager.FormatMessage(args, "user", groupName)))
+
+	case "cekwelcome", "templatewelcome":
+		groupName := w.GetGroupName(evt.Info.Chat)
+		wTpl := w.welcomeManager.GetWelcomeTemplate(chatJID)
+		lTpl := w.welcomeManager.GetLeaveTemplate(chatJID)
+
+		replyMsg := fmt.Sprintf("*TEMPLATE WELCOME & GOODBYE: %s*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"*Template Welcome:*\n%s\n\n"+
+			"*Template Goodbye:*\n%s\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"_Gunakan %ssetwelcome dan %ssetgoodbye untuk mengubah (Khusus Admin)._",
+			groupName, wTpl, lTpl, prefix, prefix)
+		_ = w.SendToJID(ctx, evt.Info.Chat, replyMsg)
 
 	case "warn", "warning":
 		if !evt.Info.IsGroup {
@@ -508,11 +568,11 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 				_, kickErr := w.client.UpdateGroupParticipants(ctx, evt.Info.Chat, []types.JID{targetJID}, whatsmeow.ParticipantChangeRemove)
 				if kickErr == nil {
 					w.warnManager.ResetWarn(chatJID, targetJID.User)
-					kickMsg := fmt.Sprintf("🚫 *BATAS PERINGATAN [3/3] TERCAPAI!*\n"+
+					kickMsg := fmt.Sprintf("*BATAS PERINGATAN [3/3] TERCAPAI!*\n"+
 						"━━━━━━━━━━━━━━━━━━━━━\n"+
 						"• Target: @%s\n"+
 						"• Alasan: *%s*\n"+
-						"• Tindakan: *Dikeluarkan dari grup (Kick)* 🚪\n"+
+						"• Tindakan: *Dikeluarkan dari grup (Kick)* \n"+
 						"━━━━━━━━━━━━━━━━━━━━━",
 						targetJID.User, reason)
 					_ = w.SendWithMentions(ctx, evt.Info.Chat, kickMsg, []string{targetJID.String()})
@@ -521,7 +581,7 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 			}
 
 			// Jika bot bukan admin
-			alertMsg := fmt.Sprintf("🚫 *BATAS PERINGATAN [3/3] TERCAPAI!*\n"+
+			alertMsg := fmt.Sprintf("*BATAS PERINGATAN [3/3] TERCAPAI!*\n"+
 				"━━━━━━━━━━━━━━━━━━━━━\n"+
 				"• Target: @%s\n"+
 				"• Alasan: *%s*\n"+
@@ -534,25 +594,25 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 	case "resetwarn", "unwarn", "clearwarn":
 		if !evt.Info.IsGroup {
-			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
 			return
 		}
 
 		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
 			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
-			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Hanya Admin grup atau Owner bot yang dapat me-reset peringatan.")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Akses ditolak! Hanya Admin grup atau Owner bot yang dapat me-reset peringatan.")
 			return
 		}
 
 		targetJID, _ := w.extractTargetUser(evt, args)
 		if targetJID.IsEmpty() {
-			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("⚠️ Tag atau reply user yang ingin di-reset warn!\nContoh: *%sresetwarn @user*", prefix))
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("Tag atau reply user yang ingin di-reset warn!\nContoh: *%sresetwarn @user*", prefix))
 			return
 		}
 
 		w.warnManager.ResetWarn(chatJID, targetJID.User)
 		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
-		resetMsg := fmt.Sprintf("✅ *PERINGATAN DI-RESET! [0/3]*\n"+
+		resetMsg := fmt.Sprintf("*PERINGATAN DI-RESET! [0/3]*\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
 			"• Target: @%s\n"+
 			"• Oleh Admin: @%s\n"+
@@ -568,7 +628,7 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		}
 
 		count := w.warnManager.GetWarn(chatJID, targetJID.User)
-		cekMsg := fmt.Sprintf("📋 *STATUS PERINGATAN*\n"+
+		cekMsg := fmt.Sprintf("*STATUS PERINGATAN*\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
 			"• User: @%s\n"+
 			"• Jumlah Warn: *[%d/3]*\n"+
@@ -578,13 +638,13 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 	case "linkthisgroup", "linkgroup", "addgroup":
 		if !evt.Info.IsGroup {
-			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
 			return
 		}
 
-		if !w.isSenderOwner(evt) {
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
 			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
-			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Perintah ini hanya bisa dipanggil oleh Owner bot (Nomor: "+w.config.OwnerNumber+").")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Akses ditolak! Perintah ini hanya untuk atmin")
 			return
 		}
 
@@ -606,7 +666,7 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		}
 
 		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
-		replyMsg := fmt.Sprintf("✅ *Grup Berhasil Dihubungkan ke Minecraft!*\n"+
+		replyMsg := fmt.Sprintf("*Grup Berhasil Dihubungkan ke Minecraft!*\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
 			"• Nama Grup: *%s*\n"+
 			"• JID: `%s`\n"+
@@ -619,13 +679,13 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 	case "unlinkthisgroup", "unlinkgroup":
 		if !evt.Info.IsGroup {
-			_ = w.SendToJID(ctx, evt.Info.Chat, "⚠️ Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Perintah ini hanya dapat digunakan di dalam grup WhatsApp!")
 			return
 		}
 
-		if !w.isSenderOwner(evt) {
+		if !w.IsUserGroupAdmin(ctx, evt.Info.Chat, evt) {
 			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
-			_ = w.SendToJID(ctx, evt.Info.Chat, "⛔ Akses ditolak! Perintah ini hanya bisa dipanggil oleh Owner bot.")
+			_ = w.SendToJID(ctx, evt.Info.Chat, "Akses ditolak! Perintah ini hanya untuk atmin")
 			return
 		}
 
@@ -642,7 +702,7 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 		groupName := w.GetGroupName(evt.Info.Chat)
 		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
-		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("🔌 Grup *%s* telah diputuskan hubungannya dari server Minecraft.", groupName))
+		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("Grup *%s* telah diputuskan hubungannya dari server Minecraft.", groupName))
 
 	case "chat", "mc", "game":
 		if args == "" {
@@ -799,6 +859,67 @@ func (w *WAClient) SendWithMentions(ctx context.Context, jid types.JID, message 
 
 	_, err := w.client.SendMessage(sendCtx, jid, msg)
 	return err
+}
+
+func (w *WAClient) SendImageWithMentions(ctx context.Context, jid types.JID, imageBytes []byte, caption string, mentions []string) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
+	}
+
+	uploadResp, err := w.client.Upload(ctx, imageBytes, whatsmeow.MediaImage)
+	if err != nil {
+		return fmt.Errorf("failed to upload image: %w", err)
+	}
+
+	imageMsg := &waProto.ImageMessage{
+		Caption:       proto.String(caption),
+		Mimetype:      proto.String("image/jpeg"),
+		URL:           &uploadResp.URL,
+		DirectPath:    &uploadResp.DirectPath,
+		MediaKey:      uploadResp.MediaKey,
+		FileEncSHA256: uploadResp.FileEncSHA256,
+		FileSHA256:    uploadResp.FileSHA256,
+		FileLength:    &uploadResp.FileLength,
+		ContextInfo: &waProto.ContextInfo{
+			MentionedJID: mentions,
+		},
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	_, err = w.client.SendMessage(sendCtx, jid, &waProto.Message{
+		ImageMessage: imageMsg,
+	})
+	return err
+}
+
+func (w *WAClient) fetchUserProfilePicture(ctx context.Context, jid types.JID) []byte {
+	picInfo, err := w.client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{})
+	if err != nil || picInfo == nil || picInfo.URL == "" {
+		return nil
+	}
+
+	httpClient := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, "GET", picInfo.URL, nil)
+	if err != nil {
+		return nil
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	return data
 }
 
 func (w *WAClient) ReactMessage(chat, sender types.JID, msgID types.MessageID, emoji string) error {

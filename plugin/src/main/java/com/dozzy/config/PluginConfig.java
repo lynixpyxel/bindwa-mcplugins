@@ -88,6 +88,14 @@ public class PluginConfig {
         return config.getBoolean("chat-bridge.notifications.elytra", true);
     }
 
+    public boolean isElytraBypassOp() {
+        return config.getBoolean("chat-bridge.notifications.bypass-op", false);
+    }
+
+    public void setElytraBypassOp(boolean bypassOp) {
+        config.set("chat-bridge.notifications.bypass-op", bypassOp);
+    }
+
     public static String colorize(String message) {
         if (message == null) {
             return "";

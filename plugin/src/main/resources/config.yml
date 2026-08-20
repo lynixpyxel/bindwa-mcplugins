@@ -38,3 +38,4 @@ chat-bridge:
     ender-dragon: true
     dragon-egg: true
     elytra: true
+    bypass-op: false

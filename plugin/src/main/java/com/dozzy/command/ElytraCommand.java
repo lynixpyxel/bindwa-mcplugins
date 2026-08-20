@@ -66,9 +66,32 @@ public class ElytraCommand implements CommandExecutor {
 
         // /elytraboard
         if (args.length > 0) {
+            // Subcommand: /elytraboard set bypassop <true/false>
+            if (args[0].equalsIgnoreCase("set")) {
+                if (!isOpOrAdmin(sender)) {
+                    sender.sendMessage(PluginConfig.colorize("&cYou do not have permission to change the elytra configuration (Only OP)."));
+                    return true;
+                }
+
+                if (args.length >= 3 && args[1].equalsIgnoreCase("bypassop")) {
+                    String valStr = args[2].toLowerCase();
+                    boolean bypass = valStr.equals("true") || valStr.equals("on") || valStr.equals("1") || valStr.equals("yes");
+                    plugin.getPluginConfig().setElytraBypassOp(bypass);
+                    plugin.getConfig().set("chat-bridge.notifications.bypass-op", bypass);
+                    plugin.saveConfig();
+
+                    String statusText = bypass ? "&aBYPASS" : "&eBYPASS NOT ACTIVE";
+                    sender.sendMessage(PluginConfig.colorize("&a[ElytraTracker] &fBypass OP &a: " + statusText));
+                    return true;
+                }
+
+                sender.sendMessage(PluginConfig.colorize("&cUsage: /elytraboard set bypassop <true/false>"));
+                return true;
+            }
+
             if (args[0].equalsIgnoreCase("reset") || args[0].equalsIgnoreCase("clear")) {
                 if (!isOpOrAdmin(sender)) {
-                    sender.sendMessage(PluginConfig.colorize("&cKamu tidak memiliki izin untuk mereset data leaderboard elytra (Hanya OP)."));
+                    sender.sendMessage(PluginConfig.colorize("&cYou do not have permission to reset the Elytra leaderboard"));
                     return true;
                 }
 
@@ -87,7 +110,7 @@ public class ElytraCommand implements CommandExecutor {
                     Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
                         databaseManager.resetPlayerElytra(targetUuid);
                         Bukkit.getScheduler().runTask(plugin, () -> {
-                            sender.sendMessage(PluginConfig.colorize("&a[ElytraTracker] Data elytra untuk &e" + targetName + "&a berhasil di-reset menjadi 0 oleh OP!"));
+                            sender.sendMessage(PluginConfig.colorize("&a[ElytraTracker] Elytra data for &e" + targetName + "&a reset to 0 by an OP."));
                         });
                     });
                     return true;
@@ -96,10 +119,10 @@ public class ElytraCommand implements CommandExecutor {
                 // Reset ALL: /elytraboard reset / /elytraboard reset all
                 Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
                     databaseManager.resetAllElytraLeaderboard();
-                    plugin.getChatBridgeManager().sendNotification("Elytra Leaderboard Reset", "🔄 *Seluruh data Leaderboard Elytra telah di-reset oleh OP!*");
+                    plugin.getChatBridgeManager().sendNotification("Elytra Leaderboard Reset", "*Leaderboard has been reset by an OP.*");
 
                     Bukkit.getScheduler().runTask(plugin, () -> {
-                        sender.sendMessage(PluginConfig.colorize("&a[ElytraTracker] Seluruh database leaderboard elytra berhasil di-reset menjadi 0 oleh OP!"));
+                        sender.sendMessage(PluginConfig.colorize("&a[ElytraTracker] Elytra leaderboard database has been reset by an OP!"));
                     });
                 });
                 return true;
@@ -109,9 +132,10 @@ public class ElytraCommand implements CommandExecutor {
         // Default: Tampilkan leaderboard
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             List<DatabaseManager.ElytraLeaderboardEntry> leaderboard = databaseManager.getElytraLeaderboard(10);
+            boolean isBypass = plugin.getPluginConfig().isElytraBypassOp();
 
             Bukkit.getScheduler().runTask(plugin, () -> {
-                sender.sendMessage(PluginConfig.colorize("&6&l🏆 LEADERBOARD PENGAMBILAN ELYTRA 🏆"));
+                sender.sendMessage(PluginConfig.colorize("&6&lELYTRA'S LEADERBOARD"));
                 sender.sendMessage(PluginConfig.colorize("&8━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
 
                 if (leaderboard.isEmpty()) {
@@ -126,7 +150,8 @@ public class ElytraCommand implements CommandExecutor {
 
                 sender.sendMessage(PluginConfig.colorize("&8━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
                 if (isOpOrAdmin(sender)) {
-                    sender.sendMessage(PluginConfig.colorize("&7&oTip OP: Gunakan '/elytraboard reset' untuk mereset seluruh leaderboard."));
+                    sender.sendMessage(PluginConfig.colorize("&7&oStatus bypass OP: " + (isBypass ? "&aTrue (Bypass)" : "&eFalse (Counted)")));
+                    sender.sendMessage(PluginConfig.colorize("&7&oPerintah OP: '/elytraboard set bypassop <true/false>' | '/elytraboard reset'"));
                 }
             });
         });

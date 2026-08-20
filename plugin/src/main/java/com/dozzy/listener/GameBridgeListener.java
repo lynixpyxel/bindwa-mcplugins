@@ -372,6 +372,11 @@ public class GameBridgeListener implements Listener {
     }
 
     private void processFreshElytraPickup(Player player, Location loc, String itemUid) {
+        if (config.isElytraBypassOp() && player.isOp()) {
+            plugin.getLogger().info("[ElytraTracker] Pengambilan elytra oleh OP " + player.getName() + " diabaikan (bypass-op: true).");
+            return;
+        }
+
         UUID ownerUuid = player.getUniqueId();
         String ownerName = player.getName();
         String worldName = loc.getWorld() != null ? loc.getWorld().getName() : "world";
@@ -441,6 +446,8 @@ public class GameBridgeListener implements Listener {
         elytra.setItemMeta(meta);
         updateElytraHolderLore(elytra, origOwner, newHolder.getName());
 
+        boolean isNewHolderOp = config.isElytraBypassOp() && newHolder.isOp();
+
         String finalOrigOwner = origOwner;
         Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
             String oldOwnerName = plugin.getDatabaseManager().getPlayerNameByUuid(oldOwnerUuid);
@@ -448,15 +455,17 @@ public class GameBridgeListener implements Listener {
             // Kurangi count dari pemilik lama
             plugin.getDatabaseManager().decrementElytraCount(oldOwnerUuid);
 
-            // Tambah count untuk pemilik baru
-            plugin.getDatabaseManager().incrementAndGetElytraCount(newHolder.getUniqueId(), newHolder.getName());
+            // Tambah count untuk pemilik baru jika bukan OP dengan bypass
+            if (!isNewHolderOp) {
+                plugin.getDatabaseManager().incrementAndGetElytraCount(newHolder.getUniqueId(), newHolder.getName());
+            }
 
-            // Kirim notifikasi transfer ke WA
-            String transferMsg = String.format("🔄 Elytra milik *%s* telah berpindah tangan ke *%s*!", oldOwnerName, newHolder.getName());
-            manager.sendNotification("Elytra Transferred", transferMsg);
-
-            // Update Leaderboard
-            broadcastLeaderboard();
+            // Kirim notifikasi transfer ke WA jika bukan OP bypass
+            if (!isNewHolderOp) {
+                String transferMsg = String.format("🔄 Elytra milik *%s* telah berpindah tangan ke *%s*!", oldOwnerName, newHolder.getName());
+                manager.sendNotification("Elytra Transferred", transferMsg);
+                broadcastLeaderboard();
+            }
 
             plugin.getLogger().info("[ElytraTracker] Transfer elytra dari " + oldOwnerName + " ke " + newHolder.getName());
         });
