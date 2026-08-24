@@ -67,12 +67,14 @@ public class BindWAPlugin extends JavaPlugin {
             getCommand("bindwa").setExecutor(new BindWACommand(this, this.bindingService, this.javaAnvilFlow, this.bedrockFormFlow));
         }
 
-        ChatBridgeCommand chatBridgeCommand = new ChatBridgeCommand(this.chatBridgeManager);
+        ChatBridgeCommand chatBridgeCommand = new ChatBridgeCommand(this, this.chatBridgeManager, this.bedrockFormFlow);
         if (getCommand("chat") != null) {
             getCommand("chat").setExecutor(chatBridgeCommand);
+            getCommand("chat").setTabCompleter(chatBridgeCommand);
         }
         if (getCommand("wa") != null) {
             getCommand("wa").setExecutor(chatBridgeCommand);
+            getCommand("wa").setTabCompleter(chatBridgeCommand);
         }
 
         com.dozzy.command.ElytraCommand elytraCommand = new com.dozzy.command.ElytraCommand(this, this.databaseManager);

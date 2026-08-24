@@ -21,6 +21,11 @@ public class ChatBridgeManager {
     private final PluginConfig config;
     private final BotApiClient apiClient;
 
+    private final java.util.Map<String, WAMessageContext> messageCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.LinkedList<String> cacheOrder = new java.util.LinkedList<>();
+    private static final int MAX_CACHE_SIZE = 100;
+    private final java.util.Set<String> knownWaUsers = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private ChatBridgeWebSocketClient wsClient;
     private BukkitTask reconnectTask;
     private BukkitTask heartbeatTask;
@@ -154,6 +159,85 @@ public class ChatBridgeManager {
 
         // Fallback HTTP
         apiClient.sendGroupChat(playerName, message);
+        return true;
+    }
+
+    public synchronized WAMessageContext saveIncomingMessage(String msgId, String groupJid, String groupName, String senderPhone, String senderJid, String pushName, String text) {
+        String cleanMsgId = (msgId != null && !msgId.isEmpty()) ? msgId : java.util.UUID.randomUUID().toString();
+        String shortId = cleanMsgId;
+        if (cleanMsgId.length() > 6) {
+            shortId = cleanMsgId.substring(cleanMsgId.length() - 6);
+        }
+
+        WAMessageContext ctx = new WAMessageContext(shortId, cleanMsgId, groupJid, groupName, senderPhone, senderJid, pushName, text);
+
+        if (pushName != null && !pushName.trim().isEmpty()) {
+            knownWaUsers.add(pushName.trim().replaceAll("\\s+", ""));
+        }
+        if (senderPhone != null && !senderPhone.trim().isEmpty()) {
+            knownWaUsers.add(senderPhone.trim());
+        }
+
+        messageCache.put(shortId.toLowerCase(), ctx);
+        messageCache.put(cleanMsgId.toLowerCase(), ctx);
+
+        cacheOrder.add(shortId.toLowerCase());
+        cacheOrder.add(cleanMsgId.toLowerCase());
+        while (cacheOrder.size() > MAX_CACHE_SIZE * 2) {
+            String oldest = cacheOrder.removeFirst();
+            messageCache.remove(oldest);
+        }
+
+        return ctx;
+    }
+
+    public java.util.List<String> getKnownWaUsers() {
+        return new java.util.ArrayList<>(knownWaUsers);
+    }
+
+    public WAMessageContext getMessageContext(String id) {
+        if (id == null) return null;
+        return messageCache.get(id.toLowerCase().trim());
+    }
+
+    public synchronized java.util.List<WAMessageContext> getRecentMessages(int limit) {
+        java.util.List<WAMessageContext> list = new java.util.ArrayList<>();
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (int i = cacheOrder.size() - 1; i >= 0; i--) {
+            String key = cacheOrder.get(i);
+            WAMessageContext ctx = messageCache.get(key);
+            if (ctx != null && seen.add(ctx.getFullMsgId())) {
+                list.add(ctx);
+                if (list.size() >= limit) {
+                    break;
+                }
+            }
+        }
+        return list;
+    }
+
+    public boolean sendReplyMessage(String playerName, String message, WAMessageContext context) {
+        if (wsClient != null && wsClient.isOpen()) {
+            JsonObject obj = new JsonObject();
+            obj.addProperty("type", "chat");
+            obj.addProperty("player", playerName);
+            obj.addProperty("message", message);
+            if (context != null) {
+                obj.addProperty("reply_to_id", context.getFullMsgId());
+                obj.addProperty("reply_group", context.getGroupJid());
+                obj.addProperty("reply_sender", context.getSenderJid());
+                obj.addProperty("quoted_text", context.getText());
+            }
+            wsClient.send(obj.toString());
+            return true;
+        }
+
+        // Fallback HTTP
+        if (context != null) {
+            apiClient.sendGroupReply(playerName, message, context.getFullMsgId(), context.getGroupJid(), context.getSenderJid(), context.getText());
+        } else {
+            apiClient.sendGroupChat(playerName, message);
+        }
         return true;
     }
 

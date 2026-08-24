@@ -106,15 +106,35 @@ public class BotApiClient {
     }
 
     public CompletableFuture<Boolean> sendGroupChat(String player, String message) {
+        return sendGroupReply(player, message, null, null, null, null);
+    }
+
+    public CompletableFuture<Boolean> sendGroupReply(String player, String message, String replyToId, String replyGroup, String replySender, String quotedText) {
         String url = trimTrailingSlash(config.getApiBaseUrl()) + "/send-group-chat";
-        String jsonBody = String.format("{\"player\":\"%s\",\"message\":\"%s\"}", escapeJson(player), escapeJson(message));
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append("\"player\":\"").append(escapeJson(player)).append("\",");
+        sb.append("\"message\":\"").append(escapeJson(message)).append("\"");
+        if (replyToId != null && !replyToId.isEmpty()) {
+            sb.append(",\"reply_to_id\":\"").append(escapeJson(replyToId)).append("\"");
+        }
+        if (replyGroup != null && !replyGroup.isEmpty()) {
+            sb.append(",\"reply_group\":\"").append(escapeJson(replyGroup)).append("\"");
+        }
+        if (replySender != null && !replySender.isEmpty()) {
+            sb.append(",\"reply_sender\":\"").append(escapeJson(replySender)).append("\"");
+        }
+        if (quotedText != null && !quotedText.isEmpty()) {
+            sb.append(",\"quoted_text\":\"").append(escapeJson(quotedText)).append("\"");
+        }
+        sb.append("}");
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + config.getApiToken())
                 .timeout(Duration.ofSeconds(10))
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .POST(HttpRequest.BodyPublishers.ofString(sb.toString()))
                 .build();
 
         return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())

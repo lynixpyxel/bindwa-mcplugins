@@ -7,11 +7,15 @@ import com.dozzy.http.BotApiClient;
 import com.dozzy.http.SendOtpResult;
 import com.dozzy.http.VerifyOtpResult;
 import com.dozzy.service.BindingService;
+import com.dozzy.bridge.ChatBridgeManager;
+import com.dozzy.bridge.WAMessageContext;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.geysermc.cumulus.form.CustomForm;
+import org.geysermc.cumulus.form.SimpleForm;
 import org.geysermc.floodgate.api.FloodgateApi;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -169,5 +173,115 @@ public class BedrockFormFlow {
         });
 
         FloodgateApi.getInstance().sendForm(uuid, builder.build());
+    }
+
+    public void openChatMenuForm(Player player, ChatBridgeManager manager) {
+        SimpleForm.Builder builder = SimpleForm.builder()
+                .title("WhatsApp Chat Bridge")
+                .content("Pilih aksi untuk chat ke grup WhatsApp:")
+                .button("Kirim Pesan Baru ke WhatsApp")
+                .button("Balas Pesan WhatsApp (Reply)");
+
+        builder.validResultHandler(response -> {
+            int buttonId = response.clickedButtonId();
+            if (buttonId == 0) {
+                openSendNewChatForm(player, manager);
+            } else if (buttonId == 1) {
+                openReplySelectForm(player, manager);
+            }
+        });
+
+        FloodgateApi.getInstance().sendForm(player.getUniqueId(), builder.build());
+    }
+
+    public void openSendNewChatForm(Player player, ChatBridgeManager manager) {
+        List<String> knownUsers = manager.getKnownWaUsers();
+
+        CustomForm.Builder builder = CustomForm.builder()
+                .title("Kirim Chat ke WhatsApp")
+                .label("Tulis pesan yang ingin dikirim ke grup WhatsApp (bisa gunakan @Nama untuk tag):");
+
+        builder.input("Pesan", "Halo semua!");
+
+        if (!knownUsers.isEmpty()) {
+            List<String> dropdownOptions = new java.util.ArrayList<>();
+            dropdownOptions.add("(Tanpa Tag)");
+            for (String user : knownUsers) {
+                dropdownOptions.add("@" + user);
+            }
+            builder.dropdown("Tag Member (Opsional)", dropdownOptions, 0);
+        }
+
+        builder.validResultHandler(response -> {
+            String msg = response.asInput(1);
+            if (msg == null || msg.trim().isEmpty()) {
+                player.sendMessage(PluginConfig.colorize("&cPesan tidak boleh kosong."));
+                return;
+            }
+
+            String finalMsg = msg.trim();
+            if (!knownUsers.isEmpty()) {
+                int selectedDropdown = response.asDropdown(2);
+                if (selectedDropdown > 0 && selectedDropdown <= knownUsers.size()) {
+                    String selectedTag = "@" + knownUsers.get(selectedDropdown - 1);
+                    if (!finalMsg.contains(selectedTag)) {
+                        finalMsg = selectedTag + " " + finalMsg;
+                    }
+                }
+            }
+
+            manager.sendChatMessage(player.getName(), finalMsg);
+            player.sendMessage(PluginConfig.colorize("&aChat berhasil dikirim ke grup WhatsApp!"));
+        });
+
+        FloodgateApi.getInstance().sendForm(player.getUniqueId(), builder.build());
+    }
+
+    public void openReplySelectForm(Player player, ChatBridgeManager manager) {
+        List<WAMessageContext> recents = manager.getRecentMessages(10);
+        if (recents.isEmpty()) {
+            player.sendMessage(PluginConfig.colorize("&7Belum ada pesan WhatsApp terbaru untuk dibalas."));
+            return;
+        }
+
+        SimpleForm.Builder builder = SimpleForm.builder()
+                .title("Pilih Pesan untuk Dibalas")
+                .content("Pilih salah satu pesan WhatsApp di bawah ini:");
+
+        for (WAMessageContext ctx : recents) {
+            String snippet = ctx.getText();
+            if (snippet.length() > 25) {
+                snippet = snippet.substring(0, 25) + "...";
+            }
+            builder.button("§e@" + ctx.getPushName() + "\n§0" + snippet);
+        }
+
+        builder.validResultHandler(response -> {
+            int index = response.clickedButtonId();
+            if (index >= 0 && index < recents.size()) {
+                openReplyInputForm(player, manager, recents.get(index));
+            }
+        });
+
+        FloodgateApi.getInstance().sendForm(player.getUniqueId(), builder.build());
+    }
+
+    public void openReplyInputForm(Player player, ChatBridgeManager manager, WAMessageContext ctx) {
+        CustomForm.Builder builder = CustomForm.builder()
+                .title("Balas Pesan WhatsApp")
+                .label("§eMembalas @" + ctx.getPushName() + "§7: §f\"" + ctx.getText() + "\"")
+                .input("Pesan Balasan", "Tulis balasanmu...");
+
+        builder.validResultHandler(response -> {
+            String replyMsg = response.asInput(1);
+            if (replyMsg != null && !replyMsg.trim().isEmpty()) {
+                manager.sendReplyMessage(player.getName(), replyMsg.trim(), ctx);
+                player.sendMessage(PluginConfig.colorize("&a[WA-Reply] Membalas &e@" + ctx.getPushName() + "&a: &f" + replyMsg.trim()));
+            } else {
+                player.sendMessage(PluginConfig.colorize("&cPesan balasan tidak boleh kosong."));
+            }
+        });
+
+        FloodgateApi.getInstance().sendForm(player.getUniqueId(), builder.build());
     }
 }

@@ -39,7 +39,19 @@ type ServerStatus struct {
 	LastUpdated time.Time `json:"last_updated"`
 }
 
-type WAMessageCallback func(groupJid, groupName, sender, pushName, text string) bool
+type WAMessageData struct {
+	MsgID        string `json:"msg_id"`
+	GroupJID     string `json:"group"`
+	GroupName    string `json:"group_name"`
+	SenderPhone  string `json:"sender"`
+	SenderJID    string `json:"sender_jid"`
+	PushName     string `json:"push_name"`
+	Text         string `json:"text"`
+	QuotedAuthor string `json:"quoted_author,omitempty"`
+	QuotedText   string `json:"quoted_text,omitempty"`
+}
+
+type WAMessageCallback func(data WAMessageData) bool
 
 type WAClient struct {
 	client          *whatsmeow.Client
@@ -55,6 +67,8 @@ type WAClient struct {
 	rulesManager    *RulesManager
 	warnManager     *WarnManager
 	welcomeManager  *WelcomeManager
+	participantMap  map[string]string
+	participantMu   sync.RWMutex
 }
 
 func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath string) (*WAClient, error) {
@@ -81,6 +95,7 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath stri
 		rulesManager:   NewRulesManager("group_rules.json"),
 		warnManager:    NewWarnManager("group_warns.json"),
 		welcomeManager: NewWelcomeManager("group_welcome.json"),
+		participantMap: make(map[string]string),
 	}
 
 	client.AddEventHandler(w.eventHandler)
@@ -406,17 +421,23 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		return
 	}
 
-	prefix, cmd, args, isCmd := w.parseCommand(text)
-	if !isCmd {
-		// Pesan bukan command -> jika bukan command atau dari bot sendiri, abaikan
-		return
-	}
-
 	chatJID := evt.Info.Chat.String()
 	senderPhone := w.resolveSenderPhone(evt)
 	pushName := evt.Info.PushName
 	if pushName == "" {
 		pushName = senderPhone
+	}
+
+	w.recordParticipant(pushName, senderPhone, evt.Info.Sender.String())
+
+	prefix, cmd, args, isCmd := w.parseCommand(text)
+	if !isCmd {
+		// Jika pesan bukan command, cek apakah me-reply pesan dari bot di grup yang terhubung
+		if evt.Info.IsGroup && w.isGroupLinked(chatJID) && w.isReplyingToBot(evt) {
+			w.forwardChatMessageToMC(evt, text)
+			return
+		}
+		return
 	}
 
 	ctx := context.Background()
@@ -710,29 +731,266 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 			return
 		}
 
-		groupName := "Grup WA"
-		if evt.Info.IsGroup {
-			groupName = w.GetGroupName(evt.Info.Chat)
-		}
+		w.forwardChatMessageToMC(evt, args)
+	}
+}
 
-		w.mu.RLock()
-		cb := w.messageCallback
-		w.mu.RUnlock()
+func (w *WAClient) forwardChatMessageToMC(evt *events.Message, text string) {
+	chatJID := evt.Info.Chat.String()
+	senderPhone := w.resolveSenderPhone(evt)
+	pushName := evt.Info.PushName
+	if pushName == "" {
+		pushName = senderPhone
+	}
 
-		success := false
-		if cb != nil {
-			success = cb(chatJID, groupName, senderPhone, pushName, args)
-		}
+	groupName := "Grup WA"
+	if evt.Info.IsGroup {
+		groupName = w.GetGroupName(evt.Info.Chat)
+	}
 
-		// Reaksi emoji ke pesan WhatsApp
-		if success {
-			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
-			fmt.Printf("[WA -> MC] [%s] %s: %s (Reacted ✅)\n", groupName, pushName, args)
-		} else {
-			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
-			fmt.Printf("[WA -> MC] Gagal forward pesan dari %s (Server offline / disconnected) (Reacted ❌)\n", senderPhone)
+	w.recordParticipant(pushName, senderPhone, evt.Info.Sender.String())
+
+	quotedAuthor, quotedText := w.extractQuotedContext(evt)
+
+	msgData := WAMessageData{
+		MsgID:        string(evt.Info.ID),
+		GroupJID:     chatJID,
+		GroupName:    groupName,
+		SenderPhone:  senderPhone,
+		SenderJID:    evt.Info.Sender.String(),
+		PushName:     pushName,
+		Text:         text,
+		QuotedAuthor: quotedAuthor,
+		QuotedText:   quotedText,
+	}
+
+	w.mu.RLock()
+	cb := w.messageCallback
+	w.mu.RUnlock()
+
+	success := false
+	if cb != nil {
+		success = cb(msgData)
+	}
+
+	// Reaksi emoji ke pesan WhatsApp
+	if success {
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+		fmt.Printf("[WA -> MC] [%s] %s (Quoted: %s): %s (Reacted ✅)\n", groupName, pushName, quotedAuthor, text)
+	} else {
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "❌")
+		fmt.Printf("[WA -> MC] Gagal forward pesan dari %s (Server offline / disconnected) (Reacted ❌)\n", senderPhone)
+	}
+}
+
+func (w *WAClient) isReplyingToBot(evt *events.Message) bool {
+	var ctxInfo *waProto.ContextInfo
+	if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
+		ctxInfo = ext.GetContextInfo()
+	} else if img := evt.Message.GetImageMessage(); img != nil {
+		ctxInfo = img.GetContextInfo()
+	} else if vid := evt.Message.GetVideoMessage(); vid != nil {
+		ctxInfo = vid.GetContextInfo()
+	}
+
+	if ctxInfo == nil || ctxInfo.GetStanzaID() == "" {
+		return false
+	}
+
+	// 1. Cek apakah participant yang di-quote adalah nomor bot sendiri
+	if w.client != nil && w.client.Store != nil && w.client.Store.ID != nil {
+		botUser := w.client.Store.ID.User
+		if strings.Contains(ctxInfo.GetParticipant(), botUser) {
+			return true
 		}
 	}
+
+	// 2. Cek apakah teks pesan yang di-quote berasal dari bot / server Minecraft
+	if qm := ctxInfo.GetQuotedMessage(); qm != nil {
+		qText := ""
+		if qm.GetConversation() != "" {
+			qText = qm.GetConversation()
+		} else if qm.GetExtendedTextMessage() != nil {
+			qText = qm.GetExtendedTextMessage().GetText()
+		} else if qm.GetImageMessage() != nil {
+			qText = qm.GetImageMessage().GetCaption()
+		}
+
+		if strings.HasPrefix(qText, "*|Server|*") ||
+			strings.HasPrefix(qText, "*Ender Dragon*") ||
+			strings.HasPrefix(qText, "*Dragon Egg*") ||
+			strings.HasPrefix(qText, "⚡ *") ||
+			strings.HasPrefix(qText, "*Leaderboard") ||
+			strings.HasPrefix(qText, "👋 *SELAMAT") ||
+			strings.HasPrefix(qText, "*PERATURAN") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (w *WAClient) recordParticipant(pushName, phone, jid string) {
+	w.participantMu.Lock()
+	defer w.participantMu.Unlock()
+
+	if w.participantMap == nil {
+		w.participantMap = make(map[string]string)
+	}
+
+	cleanJID := jid
+	if cleanJID == "" && phone != "" {
+		cleanJID = types.NewJID(phone, types.DefaultUserServer).String()
+	}
+
+	if cleanJID != "" {
+		if phone != "" {
+			w.participantMap[strings.ToLower(phone)] = cleanJID
+			w.participantMap[cleanPhone(phone)] = cleanJID
+		}
+		if pushName != "" {
+			w.participantMap[strings.ToLower(strings.ReplaceAll(pushName, " ", ""))] = cleanJID
+			w.participantMap[strings.ToLower(pushName)] = cleanJID
+		}
+	}
+}
+
+var mentionRegex = regexp.MustCompile(`@([a-zA-Z0-9_\-]+)`)
+
+func (w *WAClient) resolveMentionsInText(ctx context.Context, groupJID types.JID, text string) []string {
+	matches := mentionRegex.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	mentionsMap := make(map[string]bool)
+
+	// 1. Cek dari member grup WhatsApp via whatsmeow jika groupJID valid
+	if !groupJID.IsEmpty() {
+		info, err := w.client.GetGroupInfo(ctx, groupJID)
+		if err == nil && info != nil {
+			for _, p := range info.Participants {
+				phone := p.PhoneNumber.User
+				if phone == "" && p.JID.Server == types.DefaultUserServer {
+					phone = p.JID.User
+				}
+				targetJID := p.JID.String()
+				if targetJID == "" && phone != "" {
+					targetJID = types.NewJID(phone, types.DefaultUserServer).String()
+				}
+				if targetJID != "" {
+					for _, m := range matches {
+						tag := m[1]
+						if phone != "" && isPhoneMatch(tag, phone) {
+							mentionsMap[targetJID] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Cek dari cache participant yang sudah tercatat
+	w.participantMu.RLock()
+	for _, m := range matches {
+		tag := strings.ToLower(m[1])
+		if targetJID, exists := w.participantMap[tag]; exists {
+			mentionsMap[targetJID] = true
+		} else if targetJID, exists := w.participantMap[cleanPhone(tag)]; exists {
+			mentionsMap[targetJID] = true
+		} else if phoneRegexDigits.MatchString(tag) {
+			clean := cleanPhone(tag)
+			if strings.HasPrefix(clean, "8") {
+				clean = "62" + clean
+			}
+			j := types.NewJID(clean, types.DefaultUserServer).String()
+			mentionsMap[j] = true
+		}
+	}
+	w.participantMu.RUnlock()
+
+	if len(mentionsMap) == 0 {
+		return nil
+	}
+
+	mentions := make([]string, 0, len(mentionsMap))
+	for j := range mentionsMap {
+		mentions = append(mentions, j)
+	}
+
+	return mentions
+}
+
+func (w *WAClient) extractQuotedContext(evt *events.Message) (string, string) {
+	var quotedAuthor string
+	var quotedText string
+
+	var ctxInfo *waProto.ContextInfo
+	if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
+		ctxInfo = ext.GetContextInfo()
+	} else if img := evt.Message.GetImageMessage(); img != nil {
+		ctxInfo = img.GetContextInfo()
+	} else if vid := evt.Message.GetVideoMessage(); vid != nil {
+		ctxInfo = vid.GetContextInfo()
+	}
+
+	if ctxInfo != nil && ctxInfo.GetStanzaID() != "" {
+		if qm := ctxInfo.GetQuotedMessage(); qm != nil {
+			if qm.GetConversation() != "" {
+				quotedText = qm.GetConversation()
+			} else if qm.GetExtendedTextMessage() != nil && qm.GetExtendedTextMessage().GetText() != "" {
+				quotedText = qm.GetExtendedTextMessage().GetText()
+			} else if qm.GetImageMessage() != nil {
+				quotedText = "[Foto]"
+				if qm.GetImageMessage().GetCaption() != "" {
+					quotedText = "[Foto] " + qm.GetImageMessage().GetCaption()
+				}
+			} else if qm.GetVideoMessage() != nil {
+				quotedText = "[Video]"
+			} else if qm.GetDocumentMessage() != nil {
+				quotedText = "[Dokumen]"
+			} else if qm.GetStickerMessage() != nil {
+				quotedText = "[Stiker]"
+			}
+		}
+
+		// 1. Cek apakah yang di-quote adalah pesan server/MC (*|Server|* <PlayerName>: ...)
+		if strings.HasPrefix(quotedText, "*|Server|* <") {
+			endIdx := strings.Index(quotedText, ">:")
+			if endIdx > 12 {
+				quotedAuthor = quotedText[12:endIdx]
+				if len(quotedText) > endIdx+2 {
+					quotedText = strings.TrimSpace(quotedText[endIdx+2:])
+				}
+			}
+		}
+
+		// 2. Jika bukan dari server MC, gunakan participant info
+		if quotedAuthor == "" && ctxInfo.GetParticipant() != "" {
+			partJID, err := types.ParseJID(ctxInfo.GetParticipant())
+			if err == nil {
+				quotedAuthor = partJID.User
+				if evt.Info.IsGroup {
+					info, err := w.client.GetGroupInfo(context.Background(), evt.Info.Chat)
+					if err == nil && info != nil {
+						for _, p := range info.Participants {
+							if (p.JID.User == partJID.User || p.LID.User == partJID.User) && !p.PhoneNumber.IsEmpty() {
+								quotedAuthor = p.PhoneNumber.User
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Batasi panjang preview quoted text agar rapi di chat in-game
+		if len(quotedText) > 35 {
+			quotedText = quotedText[:35] + "..."
+		}
+	}
+
+	return quotedAuthor, quotedText
 }
 
 func (w *WAClient) replyServerStatus(target types.JID) {
@@ -940,6 +1198,81 @@ func (w *WAClient) ReactMessage(chat, sender types.JID, msgID types.MessageID, e
 }
 
 func (w *WAClient) SendToGroups(ctx context.Context, message string) int {
+	return w.SendToGroupsWithReply(ctx, message, "", "", "")
+}
+
+func (w *WAClient) SendReplyToGroup(ctx context.Context, groupJID types.JID, message string, replyToID string, replySender string, quotedText string) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
+	}
+
+	targetJID := groupJID
+	if targetJID.IsEmpty() {
+		if len(w.config.GroupJIDs) > 0 {
+			cleanJid := strings.TrimSpace(w.config.GroupJIDs[0])
+			if strings.Contains(cleanJid, "@") {
+				targetJID, _ = types.ParseJID(cleanJid)
+			} else {
+				targetJID = types.NewJID(cleanJid, types.GroupServer)
+			}
+		} else {
+			return errors.New("no group jid available")
+		}
+	}
+
+	extMsg := &waProto.ExtendedTextMessage{
+		Text: proto.String(message),
+	}
+
+	var ctxInfo *waProto.ContextInfo
+
+	if replyToID != "" {
+		ctxInfo = &waProto.ContextInfo{
+			StanzaID: proto.String(replyToID),
+		}
+		if replySender != "" {
+			var senderJID types.JID
+			if strings.Contains(replySender, "@") {
+				senderJID, _ = types.ParseJID(replySender)
+			} else {
+				senderJID = types.NewJID(replySender, types.DefaultUserServer)
+			}
+			if !senderJID.IsEmpty() {
+				ctxInfo.Participant = proto.String(senderJID.String())
+			}
+		}
+		if quotedText != "" {
+			ctxInfo.QuotedMessage = &waProto.Message{
+				Conversation: proto.String(quotedText),
+			}
+		}
+	}
+
+	// Resolve mentions (@Name atau @Phone) menjadi clickable blue tag di WhatsApp
+	mentions := w.resolveMentionsInText(ctx, targetJID, message)
+	if len(mentions) > 0 {
+		if ctxInfo == nil {
+			ctxInfo = &waProto.ContextInfo{}
+		}
+		ctxInfo.MentionedJID = append(ctxInfo.MentionedJID, mentions...)
+	}
+
+	if ctxInfo != nil {
+		extMsg.ContextInfo = ctxInfo
+	}
+
+	msg := &waProto.Message{
+		ExtendedTextMessage: extMsg,
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	_, err := w.client.SendMessage(sendCtx, targetJID, msg)
+	return err
+}
+
+func (w *WAClient) SendToGroupsWithReply(ctx context.Context, message string, replyToID string, replySender string, quotedText string) int {
 	if !w.IsReady() {
 		return 0
 	}
@@ -958,7 +1291,8 @@ func (w *WAClient) SendToGroups(ctx context.Context, message string) int {
 			jid = types.NewJID(cleanJid, types.GroupServer)
 		}
 
-		if err := w.SendToJID(ctx, jid, message); err == nil {
+		err := w.SendReplyToGroup(ctx, jid, message, replyToID, replySender, quotedText)
+		if err == nil {
 			successCount++
 		} else {
 			fmt.Printf("[WA-Client] Gagal kirim ke grup %s: %v\n", cleanJid, err)

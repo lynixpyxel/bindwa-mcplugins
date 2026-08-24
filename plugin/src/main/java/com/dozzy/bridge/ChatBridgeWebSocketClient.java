@@ -1,10 +1,14 @@
 package com.dozzy.bridge;
 
 import com.dozzy.BindWAPlugin;
-import com.dozzy.config.PluginConfig;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import net.md_5.bungee.api.chat.ClickEvent;
+import net.md_5.bungee.api.chat.ComponentBuilder;
+import net.md_5.bungee.api.chat.HoverEvent;
+import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.Bukkit;
+import org.bukkit.entity.Player;
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 
@@ -38,17 +42,53 @@ public class ChatBridgeWebSocketClient extends WebSocketClient {
 
             String type = json.get("type").getAsString();
             if ("chat_wa".equals(type)) {
+                String msgId = json.has("msg_id") ? json.get("msg_id").getAsString() : "";
+                String groupJid = json.has("group") ? json.get("group").getAsString() : "";
                 String groupName = json.has("group_name") ? json.get("group_name").getAsString() : "Grup WA";
                 String pushName = json.has("push_name") ? json.get("push_name").getAsString() : "Anon";
                 String sender = json.has("sender") ? json.get("sender").getAsString() : "";
+                String senderJid = json.has("sender_jid") ? json.get("sender_jid").getAsString() : "";
                 String text = json.has("text") ? json.get("text").getAsString() : "";
+                String quotedAuthor = json.has("quoted_author") ? json.get("quoted_author").getAsString() : "";
+                String quotedText = json.has("quoted_text") ? json.get("quoted_text").getAsString() : "";
 
-                String formattedMsg = "§b|§a" + groupName + "§b| <§a" + pushName + "§b>:§r " + text;
+                // Simpan ke cache untuk fitur Reply
+                WAMessageContext ctx = manager.saveIncomingMessage(msgId, groupJid, groupName, sender, senderJid, pushName, text);
 
-                plugin.getLogger().info("[WA -> MC] [" + groupName + "] " + pushName + ": " + text);
+                // Format tampilan chat di Minecraft
+                StringBuilder sb = new StringBuilder();
+                sb.append("§b|§a").append(groupName).append("§b| <§a").append(pushName).append("§b>");
+
+                if (!quotedAuthor.isEmpty()) {
+                    sb.append(" §8[↳ §7@").append(quotedAuthor);
+                    if (!quotedText.isEmpty()) {
+                        sb.append(": §o\"").append(quotedText).append("\"§7");
+                    }
+                    sb.append("§8]");
+                }
+
+                sb.append("§b:§r ").append(text);
+
+                String formattedText = sb.toString();
+
+                plugin.getLogger().info("[WA -> MC] [" + groupName + "] " + pushName + (quotedAuthor.isEmpty() ? "" : " (Replying @" + quotedAuthor + ")") + ": " + text);
 
                 Bukkit.getScheduler().runTask(plugin, () -> {
-                    Bukkit.broadcastMessage(formattedMsg);
+                    TextComponent mainComponent = new TextComponent(formattedText);
+
+                    // Tambahkan tombol interaktif [Reply]
+                    TextComponent replyBtn = new TextComponent(" §e[Reply]");
+                    replyBtn.setBold(true);
+                    replyBtn.setHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT,
+                            new ComponentBuilder("§aKlik untuk membalas pesan WhatsApp dari §e@" + pushName).create()));
+                    replyBtn.setClickEvent(new ClickEvent(ClickEvent.Action.SUGGEST_COMMAND,
+                            "/chat reply " + ctx.getShortId() + " "));
+
+                    mainComponent.addExtra(replyBtn);
+
+                    for (Player player : Bukkit.getOnlinePlayers()) {
+                        player.spigot().sendMessage(mainComponent);
+                    }
                 });
             }
 

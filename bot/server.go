@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.mau.fi/whatsmeow/types"
 )
 
 var phoneRegex = regexp.MustCompile(`^62\d{8,13}$`)
@@ -38,8 +39,12 @@ type VerifyOTPRequest struct {
 }
 
 type SendGroupChatRequest struct {
-	Player  string `json:"player"`
-	Message string `json:"message"`
+	Player      string `json:"player"`
+	Message     string `json:"message"`
+	ReplyToID   string `json:"reply_to_id,omitempty"`
+	ReplyGroup  string `json:"reply_group,omitempty"`
+	ReplySender string `json:"reply_sender,omitempty"`
+	QuotedText  string `json:"quoted_text,omitempty"`
 }
 
 type SendNotificationRequest struct {
@@ -67,24 +72,29 @@ func NewServer(cfg Config, otpStore *OTPStore, waClient *WAClient) *Server {
 	}
 
 	if waClient != nil {
-		waClient.SetMessageCallback(func(groupJid, groupName, sender, pushName, text string) bool {
-			return s.broadcastGroupChatToWS(groupJid, groupName, sender, pushName, text)
+		waClient.SetMessageCallback(func(data WAMessageData) bool {
+			return s.broadcastGroupChatToWS(data)
 		})
 	}
 
 	return s
 }
 
-func (s *Server) broadcastGroupChatToWS(groupJid, groupName, sender, pushName, text string) bool {
-	data, err := json.Marshal(map[string]interface{}{
-		"type":        "chat_wa",
-		"group":       groupJid,
-		"group_name":  groupName,
-		"sender":      sender,
-		"push_name":   pushName,
-		"text":        text,
-		"server_name": s.cfg.ServerName,
-	})
+func (s *Server) broadcastGroupChatToWS(data WAMessageData) bool {
+	payload := map[string]interface{}{
+		"type":          "chat_wa",
+		"msg_id":        data.MsgID,
+		"group":         data.GroupJID,
+		"group_name":    data.GroupName,
+		"sender":        data.SenderPhone,
+		"sender_jid":    data.SenderJID,
+		"push_name":     data.PushName,
+		"text":          data.Text,
+		"quoted_author": data.QuotedAuthor,
+		"quoted_text":   data.QuotedText,
+		"server_name":   s.cfg.ServerName,
+	}
+	bytes, err := json.Marshal(payload)
 	if err != nil {
 		return false
 	}
@@ -98,7 +108,7 @@ func (s *Server) broadcastGroupChatToWS(groupJid, groupName, sender, pushName, t
 
 	sentCount := 0
 	for conn := range s.wsClients {
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		if err := conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
 			_ = conn.Close()
 			delete(s.wsClients, conn)
 		} else {
@@ -261,13 +271,30 @@ func (s *Server) handleSendGroupChat(w http.ResponseWriter, r *http.Request) {
 
 	waMsg := fmt.Sprintf("*|Server|* <%s>: %s", playerName, req.Message)
 	if s.waClient != nil {
-		count := s.waClient.SendToGroups(r.Context(), waMsg)
+		var count int
+		if req.ReplyGroup != "" {
+			var gJID types.JID
+			if strings.Contains(req.ReplyGroup, "@") {
+				gJID, _ = types.ParseJID(req.ReplyGroup)
+			} else {
+				gJID = types.NewJID(req.ReplyGroup, types.GroupServer)
+			}
+			err := s.waClient.SendReplyToGroup(r.Context(), gJID, waMsg, req.ReplyToID, req.ReplySender, req.QuotedText)
+			if err == nil {
+				count = 1
+			}
+		} else if req.ReplyToID != "" {
+			count = s.waClient.SendToGroupsWithReply(r.Context(), waMsg, req.ReplyToID, req.ReplySender, req.QuotedText)
+		} else {
+			count = s.waClient.SendToGroups(r.Context(), waMsg)
+		}
+
 		s.writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status": "sent",
 			"groups": count,
 		})
 	} else {
-		fmt.Printf("[HTTP-Server] [DRY-RUN] Group chat: %s\n", waMsg)
+		fmt.Printf("[HTTP-Server] [DRY-RUN] Group chat: %s (ReplyTo: %s)\n", waMsg, req.ReplyToID)
 		s.writeJSON(w, http.StatusOK, map[string]interface{}{"status": "sent", "dry_run": true})
 	}
 }
@@ -371,10 +398,27 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				case "chat":
 					player, _ := payload["player"].(string)
 					text, _ := payload["message"].(string)
+					replyToID, _ := payload["reply_to_id"].(string)
+					replyGroup, _ := payload["reply_group"].(string)
+					replySender, _ := payload["reply_sender"].(string)
+					quotedText, _ := payload["quoted_text"].(string)
+
 					if text != "" {
 						waMsg := fmt.Sprintf("*|Server|* <%s>: %s", player, text)
 						if s.waClient != nil {
-							s.waClient.SendToGroups(context.Background(), waMsg)
+							if replyGroup != "" {
+								var gJID types.JID
+								if strings.Contains(replyGroup, "@") {
+									gJID, _ = types.ParseJID(replyGroup)
+								} else {
+									gJID = types.NewJID(replyGroup, types.GroupServer)
+								}
+								_ = s.waClient.SendReplyToGroup(context.Background(), gJID, waMsg, replyToID, replySender, quotedText)
+							} else if replyToID != "" {
+								_ = s.waClient.SendToGroupsWithReply(context.Background(), waMsg, replyToID, replySender, quotedText)
+							} else {
+								_ = s.waClient.SendToGroups(context.Background(), waMsg)
+							}
 						}
 					}
 				case "notif":
