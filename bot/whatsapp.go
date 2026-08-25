@@ -443,6 +443,54 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	ctx := context.Background()
 
 	switch cmd {
+	case "mccmdlist", "mccmd", "cmdlist", "mccommands", "commandlist":
+		msg := "*MINECRAFT SERVER COMMAND LIST*\n" +
+			"━━━━━━━━━━━━━━━━━━━━━\n\n" +
+			"*Essentials Commands:*\n" +
+			"• `/pay <player>` transfer money to someone\n" +
+			"• `/pay <player> <player>` multiple or infinite transfer\n" +
+			"• `/balance` check your balance\n" +
+			"• `/balance <player>` check player balance\n" +
+			"• `/baltop` check balance leaderboard\n" +
+			"• `/sell <item>` sell an item\n" +
+			"• `/sell <item> <amount>` bulk sell\n" +
+			"• `/sell hand` sell item in your hand\n" +
+			"• `/tpa <player>` teleport to someone\n" +
+			"• `/tpaccept` accept teleport request\n" +
+			"• `/tpahere` teleport someone to you\n" +
+			"• `/tpacancel` cancel teleport request\n" +
+			"• `/tpdeny` ignore teleport request\n" +
+			"• `/tpaall` teleport all player to you\n" +
+			"• `/back` back to your last location/death point\n" +
+			"• `/home` teleport to your respawn point\n" +
+			"• `/home <name>` teleport to your home\n" +
+			"• `/sethome <name>` set your home\n" +
+			"• `/renamehome <home> <newname>` rename home\n" +
+			"• `/delhome <name>` delete your home\n" +
+			"• `/time` check current time\n" +
+			"• `/playtime` check your playtime\n" +
+			"• `/playtime <player>` check player playtime\n" +
+			"• `/nick` set your nickname\n" +
+			"• `/hat` set your hat\n" +
+			"• `/msg <player> <text>` whisper to player\n" +
+			"• `/afk` afk\n" +
+			"• `/spawn` or `/lobby` go back to lobby\n" +
+			"• `/warp <warp>` to teleport to warp locations\n" +
+			"• `/warps` show warp list\n\n" +
+			"*Shop Commands:*\n" +
+			"• `/shop` buy some items\n" +
+			"• `/sellall <item>` sell all item you want\n" +
+			"• `/sellallhand` sell all item in your hand\n" +
+			"• `/sellgui` open gui to sell some items\n\n" +
+			"*Other Commands:*\n" +
+			"• `/bindwa` link your whatsapp account\n" +
+			"• `/elytraboard` check elytra leaderboard\n" +
+			"• `/chat` or `/chat <text>` send/reply chat to whatsapp group\n" +
+			"━━━━━━━━━━━━━━━━━━━━━"
+
+		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "📜")
+		_ = w.SendToJID(ctx, evt.Info.Chat, msg)
+
 	case "cekserver", "status", "server", "info":
 		go w.replyServerStatus(evt.Info.Chat)
 
