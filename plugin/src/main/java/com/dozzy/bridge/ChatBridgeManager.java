@@ -148,6 +148,10 @@ public class ChatBridgeManager {
     }
 
     public boolean sendChatMessage(String playerName, String message) {
+        String formatted = "§b|§6MC ➔ WA§b| <§f" + playerName + "§b>:§r " + message;
+        Bukkit.getScheduler().runTask(plugin, () -> Bukkit.broadcastMessage(formatted));
+        plugin.getLogger().info("[MC -> WA] " + playerName + ": " + message);
+
         if (wsClient != null && wsClient.isOpen()) {
             JsonObject obj = new JsonObject();
             obj.addProperty("type", "chat");
@@ -217,6 +221,22 @@ public class ChatBridgeManager {
     }
 
     public boolean sendReplyMessage(String playerName, String message, WAMessageContext context) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("§b|§6MC ➔ WA§b| <§f").append(playerName).append("§b>");
+        if (context != null) {
+            sb.append(" §8[↳ §7@").append(context.getPushName());
+            String quotedSnippet = context.getText();
+            if (quotedSnippet.length() > 30) {
+                quotedSnippet = quotedSnippet.substring(0, 30) + "...";
+            }
+            sb.append(": §o\"").append(quotedSnippet).append("\"§7§8]");
+        }
+        sb.append("§b:§r ").append(message);
+
+        String formatted = sb.toString();
+        Bukkit.getScheduler().runTask(plugin, () -> Bukkit.broadcastMessage(formatted));
+        plugin.getLogger().info("[MC -> WA] " + playerName + (context != null ? " (Replying @" + context.getPushName() + ")" : "") + ": " + message);
+
         if (wsClient != null && wsClient.isOpen()) {
             JsonObject obj = new JsonObject();
             obj.addProperty("type", "chat");

@@ -53,6 +53,11 @@ type WAMessageData struct {
 
 type WAMessageCallback func(data WAMessageData) bool
 
+type cachedGroup struct {
+	name      string
+	updatedAt time.Time
+}
+
 type WAClient struct {
 	client          *whatsmeow.Client
 	container       *sqlstore.Container
@@ -62,7 +67,7 @@ type WAClient struct {
 	isLoggedIn      bool
 	serverStatus    ServerStatus
 	messageCallback WAMessageCallback
-	groupNames      map[string]string
+	groupNames      map[string]cachedGroup
 	groupMu         sync.RWMutex
 	rulesManager    *RulesManager
 	warnManager     *WarnManager
@@ -91,7 +96,7 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath stri
 		container:      container,
 		config:         cfg,
 		configPath:     configPath,
-		groupNames:     make(map[string]string),
+		groupNames:     make(map[string]cachedGroup),
 		rulesManager:   NewRulesManager("group_rules.json"),
 		warnManager:    NewWarnManager("group_warns.json"),
 		welcomeManager: NewWelcomeManager("group_welcome.json"),
@@ -129,14 +134,20 @@ func (w *WAClient) GetServerStatus() ServerStatus {
 
 func (w *WAClient) GetGroupName(jid types.JID) string {
 	jidStr := jid.String()
+
 	w.groupMu.RLock()
-	if name, exists := w.groupNames[jidStr]; exists && name != "" {
-		w.groupMu.RUnlock()
-		return name
-	}
+	cached, exists := w.groupNames[jidStr]
 	w.groupMu.RUnlock()
 
+	// Jika cache masih segar (< 1 menit), gunakan langsung
+	if exists && cached.name != "" && time.Since(cached.updatedAt) < 1*time.Minute {
+		return cached.name
+	}
+
 	if !w.IsReady() {
+		if exists && cached.name != "" {
+			return cached.name
+		}
 		return "Grup WA"
 	}
 
@@ -146,9 +157,17 @@ func (w *WAClient) GetGroupName(jid types.JID) string {
 	info, err := w.client.GetGroupInfo(ctx, jid)
 	if err == nil && info != nil && info.Name != "" {
 		w.groupMu.Lock()
-		w.groupNames[jidStr] = info.Name
+		w.groupNames[jidStr] = cachedGroup{
+			name:      info.Name,
+			updatedAt: time.Now(),
+		}
 		w.groupMu.Unlock()
 		return info.Name
+	}
+
+	// Fallback ke cache sebelumnya jika fetch info gagal/timeout
+	if exists && cached.name != "" {
+		return cached.name
 	}
 
 	return "Grup WA"
@@ -192,6 +211,17 @@ func (w *WAClient) handleGroupParticipantsChange(evt *events.GroupInfo) {
 	// Cek apakah grup terhubung ke bot
 	if !w.isGroupLinked(chatJID) {
 		return
+	}
+
+	// Update cache nama grup secara instan jika ada event update nama grup (subject change) dari WhatsApp
+	if evt.Name != nil && evt.Name.Name != "" {
+		w.groupMu.Lock()
+		w.groupNames[chatJID] = cachedGroup{
+			name:      evt.Name.Name,
+			updatedAt: time.Now(),
+		}
+		w.groupMu.Unlock()
+		fmt.Printf("[WA-Group] Group name updated for %s: %s\n", chatJID, evt.Name.Name)
 	}
 
 	groupName := w.GetGroupName(evt.JID)
@@ -251,25 +281,22 @@ func (w *WAClient) parseCommand(text string) (prefix string, cmd string, args st
 	return "", "", "", false
 }
 
-func cleanPhone(phone string) string {
-	phone = strings.TrimPrefix(phone, "+")
-	phone = strings.TrimPrefix(phone, "0")
-	return strings.TrimSpace(phone)
+func normalizePhone(phone string) string {
+	p := strings.TrimSpace(phone)
+	p = strings.TrimPrefix(p, "+")
+	if strings.HasPrefix(p, "0") {
+		p = "62" + p[1:]
+	}
+	return p
 }
 
 func isPhoneMatch(p1, p2 string) bool {
-	c1 := cleanPhone(p1)
-	c2 := cleanPhone(p2)
-	if c1 == "" || c2 == "" {
+	n1 := normalizePhone(p1)
+	n2 := normalizePhone(p2)
+	if n1 == "" || n2 == "" {
 		return false
 	}
-	if c1 == c2 {
-		return true
-	}
-	if strings.HasSuffix(c1, c2) || strings.HasSuffix(c2, c1) {
-		return true
-	}
-	return false
+	return n1 == n2
 }
 
 func (w *WAClient) resolveSenderPhone(evt *events.Message) string {
@@ -888,17 +915,21 @@ func (w *WAClient) recordParticipant(pushName, phone, jid string) {
 
 	cleanJID := jid
 	if cleanJID == "" && phone != "" {
-		cleanJID = types.NewJID(phone, types.DefaultUserServer).String()
+		cleanJID = types.NewJID(normalizePhone(phone), types.DefaultUserServer).String()
 	}
 
 	if cleanJID != "" {
-		if phone != "" {
-			w.participantMap[strings.ToLower(phone)] = cleanJID
-			w.participantMap[cleanPhone(phone)] = cleanJID
+		normPhone := normalizePhone(phone)
+		if len(normPhone) >= 8 {
+			w.participantMap[normPhone] = cleanJID
+			w.participantMap[phone] = cleanJID
 		}
 		if pushName != "" {
-			w.participantMap[strings.ToLower(strings.ReplaceAll(pushName, " ", ""))] = cleanJID
-			w.participantMap[strings.ToLower(pushName)] = cleanJID
+			nameKey := strings.ToLower(strings.ReplaceAll(pushName, " ", ""))
+			// Abaikan nama yang terlalu pendek (< 3 karakter) atau kata umum
+			if len(nameKey) >= 3 && nameKey != "all" && nameKey != "everyone" && nameKey != "admin" {
+				w.participantMap[nameKey] = cleanJID
+			}
 		}
 	}
 }
@@ -908,6 +939,29 @@ var mentionRegex = regexp.MustCompile(`@([a-zA-Z0-9_\-]+)`)
 func (w *WAClient) resolveMentionsInText(ctx context.Context, groupJID types.JID, text string) []string {
 	matches := mentionRegex.FindAllStringSubmatch(text, -1)
 	if len(matches) == 0 {
+		return nil
+	}
+
+	var validTags []string
+	for _, m := range matches {
+		tag := m[1]
+		tagLower := strings.ToLower(tag)
+		// Abaikan selector bawaan Minecraft (@a, @p, @r, @s, @e)
+		if tagLower == "a" || tagLower == "p" || tagLower == "r" || tagLower == "s" || tagLower == "e" {
+			continue
+		}
+		// Abaikan tag all / hidetag agar tidak disalahgunakan untuk spam tag seisi grup
+		if tagLower == "all" || tagLower == "everyone" || tagLower == "here" || tagLower == "hidetag" || tagLower == "tagall" {
+			continue
+		}
+		// Abaikan kata terlalu pendek (< 3 karakter)
+		if len(tagLower) < 3 {
+			continue
+		}
+		validTags = append(validTags, tag)
+	}
+
+	if len(validTags) == 0 {
 		return nil
 	}
 
@@ -926,10 +980,9 @@ func (w *WAClient) resolveMentionsInText(ctx context.Context, groupJID types.JID
 				if targetJID == "" && phone != "" {
 					targetJID = types.NewJID(phone, types.DefaultUserServer).String()
 				}
-				if targetJID != "" {
-					for _, m := range matches {
-						tag := m[1]
-						if phone != "" && isPhoneMatch(tag, phone) {
+				if targetJID != "" && phone != "" {
+					for _, tag := range validTags {
+						if isPhoneMatch(tag, phone) {
 							mentionsMap[targetJID] = true
 						}
 					}
@@ -940,18 +993,13 @@ func (w *WAClient) resolveMentionsInText(ctx context.Context, groupJID types.JID
 
 	// 2. Cek dari cache participant yang sudah tercatat
 	w.participantMu.RLock()
-	for _, m := range matches {
-		tag := strings.ToLower(m[1])
-		if targetJID, exists := w.participantMap[tag]; exists {
+	for _, tag := range validTags {
+		tagClean := strings.ToLower(strings.ReplaceAll(tag, " ", ""))
+		if targetJID, exists := w.participantMap[tagClean]; exists {
 			mentionsMap[targetJID] = true
-		} else if targetJID, exists := w.participantMap[cleanPhone(tag)]; exists {
-			mentionsMap[targetJID] = true
-		} else if phoneRegexDigits.MatchString(tag) {
-			clean := cleanPhone(tag)
-			if strings.HasPrefix(clean, "8") {
-				clean = "62" + clean
-			}
-			j := types.NewJID(clean, types.DefaultUserServer).String()
+		} else if phoneRegexDigits.MatchString(tag) && len(tag) >= 8 {
+			normalized := normalizePhone(tag)
+			j := types.NewJID(normalized, types.DefaultUserServer).String()
 			mentionsMap[j] = true
 		}
 	}
@@ -1268,6 +1316,11 @@ func (w *WAClient) SendReplyToGroup(ctx context.Context, groupJID types.JID, mes
 		}
 	}
 
+	// Jika pesan biasa (bukan quoted reply) dan tidak mengandung karakter '@', kirim sebagai plain conversation murni
+	if replyToID == "" && !strings.Contains(message, "@") {
+		return w.SendToJID(ctx, targetJID, message)
+	}
+
 	extMsg := &waProto.ExtendedTextMessage{
 		Text: proto.String(message),
 	}
@@ -1296,13 +1349,15 @@ func (w *WAClient) SendReplyToGroup(ctx context.Context, groupJID types.JID, mes
 		}
 	}
 
-	// Resolve mentions (@Name atau @Phone) menjadi clickable blue tag di WhatsApp
-	mentions := w.resolveMentionsInText(ctx, targetJID, message)
-	if len(mentions) > 0 {
-		if ctxInfo == nil {
-			ctxInfo = &waProto.ContextInfo{}
+	// Resolve mentions (@Name atau @Phone) menjadi clickable blue tag di WhatsApp HANYA JIKA ADA '@'
+	if strings.Contains(message, "@") {
+		mentions := w.resolveMentionsInText(ctx, targetJID, message)
+		if len(mentions) > 0 {
+			if ctxInfo == nil {
+				ctxInfo = &waProto.ContextInfo{}
+			}
+			ctxInfo.MentionedJID = append(ctxInfo.MentionedJID, mentions...)
 		}
-		ctxInfo.MentionedJID = append(ctxInfo.MentionedJID, mentions...)
 	}
 
 	if ctxInfo != nil {

@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"testing"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 func TestRulesManager(t *testing.T) {
@@ -57,5 +59,54 @@ func TestWarnManager(t *testing.T) {
 	wm.ResetWarn("123@g.us", "62812345")
 	if count := wm.GetWarn("123@g.us", "62812345"); count != 0 {
 		t.Errorf("Expected 0 warns after reset, got %d", count)
+	}
+}
+
+func TestPhoneMatchingAndMentions(t *testing.T) {
+	// Strict phone match tests
+	if isPhoneMatch("1", "6285294959195") {
+		t.Errorf("Single digit should NOT match phone number")
+	}
+	if isPhoneMatch("8", "6285294959195") {
+		t.Errorf("Single digit '8' should NOT match phone number")
+	}
+	if isPhoneMatch("852", "6285294959195") {
+		t.Errorf("Partial prefix '852' should NOT match full phone number")
+	}
+	if !isPhoneMatch("085294959195", "6285294959195") {
+		t.Errorf("085294959195 should match 6285294959195")
+	}
+	if !isPhoneMatch("+6285294959195", "6285294959195") {
+		t.Errorf("+6285294959195 should match 6285294959195")
+	}
+
+	// WAClient mention tests
+	client := &WAClient{
+		participantMap: make(map[string]string),
+	}
+	client.recordParticipant("Dozzy", "6285294959195", "6285294959195@s.whatsapp.net")
+	client.recordParticipant("Budi", "6281234567890", "6281234567890@s.whatsapp.net")
+
+	// Test exact name mention
+	m1 := client.resolveMentionsInText(nil, types.EmptyJID, "Halo @Dozzy apa kabar")
+	if len(m1) != 1 || m1[0] != "6285294959195@s.whatsapp.net" {
+		t.Errorf("Expected 1 mention for Dozzy, got %v", m1)
+	}
+
+	// Test Minecraft selectors should NOT trigger mentions
+	m2 := client.resolveMentionsInText(nil, types.EmptyJID, "Coba /msg @a halo")
+	if len(m2) != 0 {
+		t.Errorf("Minecraft selector @a should NOT trigger mentions, got %v", m2)
+	}
+
+	m3 := client.resolveMentionsInText(nil, types.EmptyJID, "Coba /msg @p atau @s")
+	if len(m3) != 0 {
+		t.Errorf("Minecraft selector @p/@s should NOT trigger mentions, got %v", m3)
+	}
+
+	// Test short numbers or random words should NOT trigger mentions
+	m4 := client.resolveMentionsInText(nil, types.EmptyJID, "Beli level @1 atau @2")
+	if len(m4) != 0 {
+		t.Errorf("Short numbers should NOT trigger mentions, got %v", m4)
 	}
 }
