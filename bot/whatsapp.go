@@ -14,6 +14,7 @@ import (
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -72,8 +73,10 @@ type WAClient struct {
 	rulesManager    *RulesManager
 	warnManager     *WarnManager
 	welcomeManager  *WelcomeManager
-	participantMap  map[string]string
-	participantMu   sync.RWMutex
+	participantMap    map[string]string
+	participantMu     sync.RWMutex
+	latestLeaderboard []LeaderboardEntry
+	leaderboardMu     sync.RWMutex
 }
 
 func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath string) (*WAClient, error) {
@@ -519,7 +522,10 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		_ = w.SendToJID(ctx, evt.Info.Chat, msg)
 
 	case "cekserver", "status", "server", "info":
-		go w.replyServerStatus(evt.Info.Chat)
+		go w.replyServerStatus(evt.Info.Chat, evt)
+
+	case "top", "leaderboard", "elytratop", "elytraboard":
+		go w.replyLeaderboard(evt.Info.Chat, evt)
 
 	case "rules", "rule", "peraturan":
 		groupName := w.GetGroupName(evt.Info.Chat)
@@ -1089,7 +1095,7 @@ func (w *WAClient) extractQuotedContext(evt *events.Message) (string, string) {
 	return quotedAuthor, quotedText
 }
 
-func (w *WAClient) replyServerStatus(target types.JID) {
+func (w *WAClient) replyServerStatus(target types.JID, replyTo *events.Message) {
 	status := w.GetServerStatus()
 
 	var replyText string
@@ -1121,7 +1127,135 @@ func (w *WAClient) replyServerStatus(target types.JID) {
 			w.config.ServerName)
 	}
 
-	_ = w.SendToJID(context.Background(), target, replyText)
+	replyToID := ""
+	replySender := ""
+	if replyTo != nil {
+		replyToID = string(replyTo.Info.ID)
+		replySender = replyTo.Info.Sender.ToNonAD().String()
+	}
+
+	_ = w.SendReplyToGroup(context.Background(), target, replyText, replyToID, replySender, "")
+}
+
+func (w *WAClient) UpdateLeaderboardFromText(text string) {
+	lines := strings.Split(text, "\n")
+	var entries []LeaderboardEntry
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "*") {
+			continue
+		}
+		// Format: "1. Steve — 5 elytra" or "1. Steve - 5000m"
+		parts := strings.SplitN(line, ".", 2)
+		if len(parts) == 2 {
+			rank := strings.TrimSpace(parts[0])
+			rest := strings.TrimSpace(parts[1])
+
+			var player, count string
+			foundSep := false
+			for _, sep := range []string{" — ", " - ", " : ", "—", "-", ":"} {
+				if idx := strings.Index(rest, sep); idx != -1 {
+					player = strings.TrimSpace(rest[:idx])
+					count = strings.TrimSpace(rest[idx+len(sep):])
+					foundSep = true
+					break
+				}
+			}
+
+			if !foundSep {
+				fields := strings.Fields(rest)
+				if len(fields) >= 2 {
+					player = fields[0]
+					count = strings.Join(fields[1:], " ")
+				} else {
+					player = rest
+					count = "-"
+				}
+			}
+			entries = append(entries, LeaderboardEntry{
+				Rank:   "#" + rank,
+				Player: player,
+				Count:  count,
+			})
+		}
+	}
+
+	w.leaderboardMu.Lock()
+	if len(entries) > 0 {
+		w.latestLeaderboard = entries
+	}
+	w.leaderboardMu.Unlock()
+}
+
+func (w *WAClient) replyLeaderboard(target types.JID, replyTo *events.Message) {
+	w.leaderboardMu.RLock()
+	entries := make([]LeaderboardEntry, len(w.latestLeaderboard))
+	copy(entries, w.latestLeaderboard)
+	w.leaderboardMu.RUnlock()
+
+	headers := []string{"Rank", "Player", "Elytra Count"}
+	var rows [][]string
+
+	if len(entries) == 0 {
+		rows = append(rows, []string{"-", "No data", "-"})
+	} else {
+		for _, e := range entries {
+			rows = append(rows, []string{e.Rank, e.Player, e.Count})
+		}
+	}
+
+	submessages := []*waAICommonDeprecated.AIRichResponseSubMessage{
+		NewRichTextSubMessage("# Elytra Leaderboard"),
+		NewRichTableSubMessage("Elytra Leaderboard", headers, rows),
+	}
+
+	if w.client != nil {
+		if err := SendRichMessage(w.client, target, submessages, replyTo); err != nil {
+			fmt.Printf("[WAClient] replyLeaderboard SendRichMessage error: %v\n", err)
+		}
+	}
+}
+
+func (w *WAClient) BroadcastRichLeaderboard(ctx context.Context) int {
+	if !w.IsReady() {
+		return 0
+	}
+
+	w.leaderboardMu.RLock()
+	entries := make([]LeaderboardEntry, len(w.latestLeaderboard))
+	copy(entries, w.latestLeaderboard)
+	w.leaderboardMu.RUnlock()
+
+	headers := []string{"Rank", "Player", "Elytra Count"}
+	var rows [][]string
+	for _, e := range entries {
+		rows = append(rows, []string{e.Rank, e.Player, e.Count})
+	}
+
+	submessages := []*waAICommonDeprecated.AIRichResponseSubMessage{
+		NewRichTextSubMessage("# Elytra Leaderboard Update"),
+		NewRichTableSubMessage("Elytra Leaderboard", headers, rows),
+	}
+
+	successCount := 0
+	for _, rawJid := range w.config.GroupJIDs {
+		cleanJid := strings.TrimSpace(rawJid)
+		if cleanJid == "" {
+			continue
+		}
+		var gJID types.JID
+		if strings.Contains(cleanJid, "@") {
+			gJID, _ = types.ParseJID(cleanJid)
+		} else {
+			gJID = types.NewJID(cleanJid, types.GroupServer)
+		}
+
+		err := SendRichMessage(w.client, gJID, submessages, nil)
+		if err == nil {
+			successCount++
+		}
+	}
+	return successCount
 }
 
 func (w *WAClient) Start(ctx context.Context) error {

@@ -207,6 +207,10 @@ public class GameBridgeListener implements Listener {
         }
 
         if (event.getEntity() instanceof ItemFrame frame && event.getDamager() instanceof Player player) {
+            if (config.isElytraBypassOp() && player.isOp()) {
+                return;
+            }
+
             ItemStack frameItem = frame.getItem();
             if (frameItem.getType() != Material.ELYTRA || isAlreadyTagged(frameItem)) {
                 return;
@@ -265,6 +269,10 @@ public class GameBridgeListener implements Listener {
             }
 
             // Jika item belum pernah di-tag (fresh pickup)
+            if (config.isElytraBypassOp() && player.isOp()) {
+                return;
+            }
+
             String uid = UUID.randomUUID().toString();
             tagElytra(item, player, uid);
             processFreshElytraPickup(player, event.getItem().getLocation(), uid);

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -33,9 +34,11 @@ type SendOTPRequest struct {
 }
 
 type VerifyOTPRequest struct {
-	UUID  string `json:"uuid"`
-	Phone string `json:"phone"`
-	OTP   string `json:"otp"`
+	UUID     string `json:"uuid"`
+	Phone    string `json:"phone"`
+	OTP      string `json:"otp"`
+	Username string `json:"username,omitempty"`
+	Player   string `json:"player,omitempty"`
 }
 
 type SendGroupChatRequest struct {
@@ -244,6 +247,32 @@ func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Kirim notifikasi konfirmasi akun jika WhatsApp bot aktif
+	if s.waClient != nil && s.waClient.IsReady() {
+		userJID := types.NewJID(normalizePhone(req.Phone), types.DefaultUserServer)
+
+		username := req.Username
+		if username == "" {
+			username = req.Player
+		}
+		if username == "" {
+			username = "Player"
+		}
+		bindTime := time.Now().Format("02 Jan 2006 15:04:05 WIB")
+
+		msg := fmt.Sprintf("✅ *VERIFIKASI BERHASIL*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• Username MC: *%s*\n"+
+			"• UUID: `%s`\n"+
+			"• Nomor WA: *%s*\n"+
+			"• Waktu Bind: *%s*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"Akun Minecraft dan nomor WhatsApp Anda kini telah resmi terhubung.",
+			username, req.UUID, req.Phone, bindTime)
+
+		_ = s.waClient.SendToJID(r.Context(), userJID, msg)
+	}
+
 	s.writeJSON(w, http.StatusOK, APIResponse{Status: "verified"})
 }
 
@@ -311,15 +340,21 @@ func (s *Server) handleSendNotification(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	formatted := fmt.Sprintf("*%s*\n%s", req.Title, req.Message)
 	if s.waClient != nil {
-		count := s.waClient.SendToGroups(r.Context(), formatted)
+		var count int
+		if strings.Contains(strings.ToLower(req.Title), "leaderboard") {
+			s.waClient.UpdateLeaderboardFromText(req.Message)
+			count = s.waClient.BroadcastRichLeaderboard(r.Context())
+		} else {
+			formatted := fmt.Sprintf("*%s*\n%s", req.Title, req.Message)
+			count = s.waClient.SendToGroups(r.Context(), formatted)
+		}
 		s.writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status": "sent",
 			"groups": count,
 		})
 	} else {
-		fmt.Printf("[HTTP-Server] [DRY-RUN] Group notif: %s\n", formatted)
+		fmt.Printf("[HTTP-Server] [DRY-RUN] Group notif: %s: %s\n", req.Title, req.Message)
 		s.writeJSON(w, http.StatusOK, map[string]interface{}{"status": "sent", "dry_run": true})
 	}
 }
@@ -425,9 +460,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					title, _ := payload["title"].(string)
 					text, _ := payload["message"].(string)
 					if text != "" {
-						formatted := fmt.Sprintf("*%s*\n%s", title, text)
 						if s.waClient != nil {
-							s.waClient.SendToGroups(context.Background(), formatted)
+							if strings.Contains(strings.ToLower(title), "leaderboard") {
+								s.waClient.UpdateLeaderboardFromText(text)
+								s.waClient.BroadcastRichLeaderboard(context.Background())
+							} else {
+								formatted := fmt.Sprintf("*%s*\n%s", title, text)
+								s.waClient.SendToGroups(context.Background(), formatted)
+							}
 						}
 					}
 				}
