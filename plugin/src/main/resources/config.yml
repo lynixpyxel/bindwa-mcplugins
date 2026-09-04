@@ -39,3 +39,10 @@ chat-bridge:
     dragon-egg: true
     elytra: true
     bypass-op: false
+
+# ====================================================================
+# Konfigurasi ImageMap Minecraft Integration
+# ====================================================================
+imagemap:
+  create-command: "imageframe create {player}:{name} {url} {width} {height} combined"
+  give-command: "imageframe get {player}:{name} combined {player}"

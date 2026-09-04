@@ -85,7 +85,13 @@ public class BindWAPlugin extends JavaPlugin {
             getCommand("elytracheck").setExecutor(elytraCommand);
         }
 
-        getLogger().info("BindWA Plugin + WhatsApp Chat Bridge + Elytra Tracker berhasil diaktifkan! (Versi: " + getDescription().getVersion() + ")");
+        com.dozzy.command.GetImageMapCommand getImageMapCommand = new com.dozzy.command.GetImageMapCommand(this);
+        if (getCommand("getimagemap") != null) {
+            getCommand("getimagemap").setExecutor(getImageMapCommand);
+            getCommand("getimagemap").setTabCompleter(getImageMapCommand);
+        }
+
+        getLogger().info("BindWA Plugin + WhatsApp Chat Bridge + Elytra Tracker + ImageMap berhasil diaktifkan! (Versi: " + getDescription().getVersion() + ")");
     }
 
     @Override

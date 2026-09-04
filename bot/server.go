@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -79,25 +80,16 @@ func NewServer(cfg Config, otpStore *OTPStore, waClient *WAClient) *Server {
 		waClient.SetMessageCallback(func(data WAMessageData) bool {
 			return s.broadcastGroupChatToWS(data)
 		})
+		waClient.SetBroadcastCallback(func(payload interface{}) bool {
+			return s.BroadcastJSONToWS(payload)
+		})
 	}
 
 	return s
 }
 
-func (s *Server) broadcastGroupChatToWS(data WAMessageData) bool {
-	payload := map[string]interface{}{
-		"type":          "chat_wa",
-		"msg_id":        data.MsgID,
-		"group":         data.GroupJID,
-		"group_name":    data.GroupName,
-		"sender":        data.SenderPhone,
-		"sender_jid":    data.SenderJID,
-		"push_name":     data.PushName,
-		"text":          data.Text,
-		"quoted_author": data.QuotedAuthor,
-		"quoted_text":   data.QuotedText,
-		"server_name":   s.cfg.ServerName,
-	}
+// BroadcastJSONToWS mem-broadcast objek JSON ke semua client WebSocket (Minecraft plugin).
+func (s *Server) BroadcastJSONToWS(payload interface{}) bool {
 	bytes, err := json.Marshal(payload)
 	if err != nil {
 		return false
@@ -121,6 +113,23 @@ func (s *Server) broadcastGroupChatToWS(data WAMessageData) bool {
 	}
 
 	return sentCount > 0
+}
+
+func (s *Server) broadcastGroupChatToWS(data WAMessageData) bool {
+	payload := map[string]interface{}{
+		"type":          "chat_wa",
+		"msg_id":        data.MsgID,
+		"group":         data.GroupJID,
+		"group_name":    data.GroupName,
+		"sender":        data.SenderPhone,
+		"sender_jid":    data.SenderJID,
+		"push_name":     data.PushName,
+		"text":          data.Text,
+		"quoted_author": data.QuotedAuthor,
+		"quoted_text":   data.QuotedText,
+		"server_name":   s.cfg.ServerName,
+	}
+	return s.BroadcastJSONToWS(payload)
 }
 
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -491,6 +500,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 							}
 						}
 					}
+				case "imagemap_order_status":
+					orderID, _ := payload["order_id"].(string)
+					bound, _ := payload["bound"].(bool)
+					playerName, _ := payload["player_name"].(string)
+					if s.waClient != nil && orderID != "" {
+						s.waClient.HandleImageMapOrderStatusFromMC(orderID, bound, playerName)
+					}
 				}
 			}
 		}
@@ -520,6 +536,14 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/server-status", s.authMiddleware(s.handleServerStatus))
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/health", s.handleHealth)
+
+	// Static file server untuk melayani gambar ImageMap ke server Minecraft
+	uploadDir := s.cfg.ImageMapUploadDir
+	if uploadDir == "" {
+		uploadDir = "upload/images"
+	}
+	_ = os.MkdirAll(uploadDir, 0755)
+	mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir(uploadDir))))
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.HTTPBind, s.cfg.HTTPPort)
 	s.srv = &http.Server{

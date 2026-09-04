@@ -24,6 +24,10 @@ commands:
   elytracheck:
     description: Cek total pengambilan elytra pemain tertentu
     usage: /elytracheck <player>
+  getimagemap:
+    description: Ambil item poster imagemap yang telah dipesan melalui WhatsApp
+    usage: /getimagemap [nama_map]
+    aliases: [claimimagemap]
 
 permissions:
   bindwa.admin:
@@ -31,6 +35,9 @@ permissions:
     default: op
   bindwa.chat:
     description: Izin untuk menggunakan perintah /chat dan /wa ke WhatsApp/Discord
+    default: true
+  bindwa.imagemap.claim:
+    description: Izin untuk mengklaim item imagemap yang dipesan
     default: true
   elytratracker.admin:
     description: Izin admin untuk cek data elytra pemain

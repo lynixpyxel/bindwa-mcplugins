@@ -96,6 +96,37 @@ public class PluginConfig {
         config.set("chat-bridge.notifications.bypass-op", bypassOp);
     }
 
+    public String getImageMapCreateCommand() {
+        return config.getString("imagemap.create-command", "imageframe create {player}:{name} {url} {width} {height} combined");
+    }
+
+    public String getImageMapGiveCommand() {
+        return config.getString("imagemap.give-command", "imageframe get {player}:{name} combined {player}");
+    }
+
+    public String buildImageMapCreateCommand(String playerName, String mapName, String url, int width, int height) {
+        String template = getImageMapCreateCommand();
+        if (!template.contains("{player}")) {
+            template = template.replace("{name}", "{player}:{name}");
+        }
+        return template
+                .replace("{player}", playerName)
+                .replace("{name}", mapName)
+                .replace("{url}", url)
+                .replace("{width}", String.valueOf(width))
+                .replace("{height}", String.valueOf(height));
+    }
+
+    public String buildImageMapGiveCommand(String playerName, String mapName) {
+        String template = getImageMapGiveCommand();
+        if (!template.contains("{player}:{name}") && template.contains("{name}")) {
+            template = template.replace("{name}", "{player}:{name}");
+        }
+        return template
+                .replace("{player}", playerName)
+                .replace("{name}", mapName);
+    }
+
     public static String colorize(String message) {
         if (message == null) {
             return "";

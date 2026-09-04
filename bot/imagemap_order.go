@@ -190,7 +190,8 @@ type ImageMapOrder struct {
 	Height        int       `json:"height"`
 	TotalTiles    int       `json:"total_tiles"`
 	Amount        int       `json:"amount"`
-	Status        string    `json:"status"` // awaiting_approval, pending, paid, rejected, cancelled_by_user, expired
+	Status        string    `json:"status"` // awaiting_approval, pending, paid, waiting_mc_username, rejected, cancelled_by_user, expired
+	PlayerName    string    `json:"player_name,omitempty"`
 	SavedFileName string    `json:"saved_file_name,omitempty"`
 	RejectReason  string    `json:"reject_reason,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -355,6 +356,49 @@ func (m *ImageMapOrderManager) CompleteOrder(paymentID string, savedFileName str
 
 	go m.saveTransactionRecord(order)
 	return nil
+}
+
+// SetOrderWaitingUsername menandai order sedang menunggu input username Minecraft dari pemesan.
+func (m *ImageMapOrderManager) SetOrderWaitingUsername(paymentID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleanID := strings.ToUpper(strings.TrimSpace(paymentID))
+	order, exists := m.byPaymentID[cleanID]
+	if exists && order != nil {
+		order.Status = "waiting_mc_username"
+		order.UpdatedAt = time.Now()
+		go m.saveTransactionRecord(order)
+	}
+}
+
+// GetOrderWaitingUsername mencari order yang sedang menunggu input username Minecraft untuk nomor HP pemesan tertentu.
+func (m *ImageMapOrderManager) GetOrderWaitingUsername(phone string) *ImageMapOrder {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cleanPhone := strings.TrimSpace(phone)
+	for _, order := range m.byPaymentID {
+		if order != nil && order.SenderPhone == cleanPhone && order.Status == "waiting_mc_username" {
+			return order
+		}
+	}
+	return nil
+}
+
+// AssignPlayerToOrder menetapkan username Minecraft ke pesanan imagemap.
+func (m *ImageMapOrderManager) AssignPlayerToOrder(paymentID, playerName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleanID := strings.ToUpper(strings.TrimSpace(paymentID))
+	order, exists := m.byPaymentID[cleanID]
+	if exists && order != nil {
+		order.PlayerName = playerName
+		order.Status = "paid"
+		order.UpdatedAt = time.Now()
+		go m.saveTransactionRecord(order)
+	}
 }
 
 // CancelOrder membatalkan pesanan.
@@ -1262,19 +1306,42 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 
 				_ = w.imagemapManager.CompleteOrder(order.PaymentID, fileName)
 
-				successMsg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
-					"Rincian Pesanan:\n"+
-					"Nama Map    : %s\n"+
-					"Ukuran      : %dx%d (%d tile)\n"+
-					"Total Bayar : Rp %s\n"+
-					"Payment ID  : %s\n"+
-					"Status      : Tersimpan di server\n\n"+
-					"Terima kasih, pembayaran Anda telah terverifikasi.\n"+
-					"Gambar untuk map '%s' sudah berhasil disimpan di server Minecraft.",
-					order.MapName, order.Width, order.Height, order.TotalTiles,
-					formatRupiah(order.Amount), order.PaymentID, order.MapName)
+				// Kirim event WebSocket ke server Minecraft
+				publicURL := w.config.PublicURL
+				if publicURL == "" {
+					publicURL = fmt.Sprintf("http://192.168.18.67:%d", w.config.HTTPPort)
+				}
+				imageURL := fmt.Sprintf("%s/images/%s", strings.TrimSuffix(publicURL, "/"), fileName)
 
-				_ = w.SendToJID(context.Background(), chatJID, successMsg)
+				broadcasted := false
+				if w.broadcastCallback != nil {
+					broadcasted = w.broadcastCallback(map[string]interface{}{
+						"type":         "imagemap_paid",
+						"order_id":     order.PaymentID,
+						"map_name":     order.MapName,
+						"width":        order.Width,
+						"height":       order.Height,
+						"sender_phone": order.SenderPhone,
+						"image_path":   "/images/" + fileName,
+						"image_url":    imageURL,
+					})
+				}
+
+				if !broadcasted {
+					// Fallback jika belum tersambung ke WebSocket Minecraft plugin
+					w.imagemapManager.SetOrderWaitingUsername(order.PaymentID)
+					fallbackMsg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
+						"Rincian Pesanan:\n"+
+						"Nama Map    : %s\n"+
+						"Ukuran      : %dx%d (%d tile)\n"+
+						"Total Bayar : Rp %s\n"+
+						"Payment ID  : %s\n\n"+
+						"Gambar telah tersimpan di server. Silakan balas pesan ini dengan Username Minecraft Anda agar map dapat diklaim di dalam game.\n"+
+						"(Catatan: Untuk pemain Bedrock, wajib diawali tanda titik, contoh: *.NamaPlayer*)",
+						order.MapName, order.Width, order.Height, order.TotalTiles,
+						formatRupiah(order.Amount), order.PaymentID)
+					_ = w.SendToJID(context.Background(), chatJID, fallbackMsg)
+				}
 
 				// Beritahu juga grup log
 				logNotice := fmt.Sprintf("Pembayaran Terverifikasi\n\n"+
@@ -1282,9 +1349,10 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 					"Nama Map    : %s\n"+
 					"Pemesan     : %s\n"+
 					"Total       : Rp %s\n"+
-					"Lokasi File : %s",
+					"Lokasi File : %s\n"+
+					"Image URL   : %s",
 					order.PaymentID, order.MapName, order.SenderPhone,
-					formatRupiah(order.Amount), filePath)
+					formatRupiah(order.Amount), filePath, imageURL)
 				for _, target := range w.getModerationTargets() {
 					_ = w.SendToJID(context.Background(), target, logNotice)
 				}

@@ -94,6 +94,33 @@ public class DatabaseManager {
                     total_count INTEGER NOT NULL DEFAULT 0
                 );
             """);
+
+            // Tabel imagemap_claims untuk pesanan map dari bot WhatsApp
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS imagemap_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id TEXT NOT NULL UNIQUE,
+                    map_name TEXT NOT NULL,
+                    player_name TEXT,
+                    sender_phone TEXT,
+                    image_url TEXT,
+                    width INTEGER DEFAULT 1,
+                    height INTEGER DEFAULT 1,
+                    claimed INTEGER DEFAULT 0,
+                    created_at INTEGER,
+                    claimed_at INTEGER
+                );
+            """);
+
+            try {
+                stmt.execute("ALTER TABLE imagemap_claims ADD COLUMN image_url TEXT;");
+            } catch (SQLException ignored) {}
+            try {
+                stmt.execute("ALTER TABLE imagemap_claims ADD COLUMN width INTEGER DEFAULT 1;");
+            } catch (SQLException ignored) {}
+            try {
+                stmt.execute("ALTER TABLE imagemap_claims ADD COLUMN height INTEGER DEFAULT 1;");
+            } catch (SQLException ignored) {}
         }
 
         syncToJson();
@@ -446,6 +473,184 @@ public class DatabaseManager {
         } catch (SQLException e) {
             logger.log(Level.SEVERE, "Gagal mereset elytra untuk UUID: " + ownerUuid, e);
         }
+    }
+
+    public synchronized void saveImageMapClaim(String orderId, String mapName, String playerName, String senderPhone, String imageUrl, int width, int height) {
+        long now = System.currentTimeMillis() / 1000L;
+        String sql = """
+            INSERT INTO imagemap_claims (order_id, map_name, player_name, sender_phone, image_url, width, height, claimed, created_at, claimed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
+            ON CONFLICT(order_id) DO UPDATE SET
+                map_name = excluded.map_name,
+                player_name = COALESCE(excluded.player_name, imagemap_claims.player_name),
+                sender_phone = excluded.sender_phone,
+                image_url = COALESCE(excluded.image_url, imagemap_claims.image_url),
+                width = excluded.width,
+                height = excluded.height;
+        """;
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, orderId);
+            ps.setString(2, mapName);
+            ps.setString(3, playerName);
+            ps.setString(4, senderPhone);
+            ps.setString(5, imageUrl);
+            ps.setInt(6, width);
+            ps.setInt(7, height);
+            ps.setLong(8, now);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal menyimpan claim imagemap untuk order: " + orderId, e);
+        }
+    }
+
+    public synchronized void assignPlayerToClaim(String orderId, String playerName, String imageUrl, int width, int height) {
+        String sql = """
+            UPDATE imagemap_claims
+            SET player_name = ?,
+                image_url = COALESCE(?, image_url),
+                width = CASE WHEN ? > 0 THEN ? ELSE width END,
+                height = CASE WHEN ? > 0 THEN ? ELSE height END
+            WHERE order_id = ?
+        """;
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, playerName);
+            ps.setString(2, imageUrl);
+            ps.setInt(3, width);
+            ps.setInt(4, width);
+            ps.setInt(5, height);
+            ps.setInt(6, height);
+            ps.setString(7, orderId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal menetapkan player ke claim imagemap order: " + orderId, e);
+        }
+    }
+
+    public synchronized List<ImageMapClaim> getUnclaimedImageMaps(String playerName) {
+        List<ImageMapClaim> list = new ArrayList<>();
+        if (playerName == null || playerName.trim().isEmpty()) {
+            return list;
+        }
+        String clean = playerName.trim();
+        String alt = clean.startsWith(".") ? clean.substring(1) : "." + clean;
+
+        String sql = "SELECT id, order_id, map_name, player_name, sender_phone, image_url, width, height, claimed, created_at, claimed_at FROM imagemap_claims WHERE (LOWER(player_name) = LOWER(?) OR LOWER(player_name) = LOWER(?)) AND claimed = 0 ORDER BY id ASC";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, clean);
+            ps.setString(2, alt);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long claimedAtVal = rs.getLong("claimed_at");
+                    Long claimedAt = rs.wasNull() ? null : claimedAtVal;
+                    list.add(new ImageMapClaim(
+                            rs.getInt("id"),
+                            rs.getString("order_id"),
+                            rs.getString("map_name"),
+                            rs.getString("player_name"),
+                            rs.getString("sender_phone"),
+                            rs.getString("image_url"),
+                            rs.getInt("width"),
+                            rs.getInt("height"),
+                            rs.getInt("claimed") == 1,
+                            rs.getLong("created_at"),
+                            claimedAt
+                    ));
+                }
+            }
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mengambil data claim imagemap untuk player: " + playerName, e);
+        }
+        return list;
+    }
+
+    public synchronized List<ImageMapClaim> getAllClaimsByPlayer(String playerName) {
+        List<ImageMapClaim> list = new ArrayList<>();
+        if (playerName == null || playerName.trim().isEmpty()) {
+            return list;
+        }
+        String clean = playerName.trim();
+        String alt = clean.startsWith(".") ? clean.substring(1) : "." + clean;
+
+        String sql = "SELECT id, order_id, map_name, player_name, sender_phone, image_url, width, height, claimed, created_at, claimed_at FROM imagemap_claims WHERE (LOWER(player_name) = LOWER(?) OR LOWER(player_name) = LOWER(?)) ORDER BY id DESC";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, clean);
+            ps.setString(2, alt);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long claimedAtVal = rs.getLong("claimed_at");
+                    Long claimedAt = rs.wasNull() ? null : claimedAtVal;
+                    list.add(new ImageMapClaim(
+                            rs.getInt("id"),
+                            rs.getString("order_id"),
+                            rs.getString("map_name"),
+                            rs.getString("player_name"),
+                            rs.getString("sender_phone"),
+                            rs.getString("image_url"),
+                            rs.getInt("width"),
+                            rs.getInt("height"),
+                            rs.getInt("claimed") == 1,
+                            rs.getLong("created_at"),
+                            claimedAt
+                    ));
+                }
+            }
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mengambil riwayat claim imagemap untuk player: " + playerName, e);
+        }
+        return list;
+    }
+
+    public synchronized boolean markImageMapClaimed(int id) {
+        long now = System.currentTimeMillis() / 1000L;
+        String sql = "UPDATE imagemap_claims SET claimed = 1, claimed_at = ? WHERE id = ? AND claimed = 0";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setLong(1, now);
+            ps.setInt(2, id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal menandai claim imagemap id " + id + " sebagai claimed", e);
+        }
+        return false;
+    }
+
+    public synchronized boolean resetClaimStatus(int id) {
+        String sql = "UPDATE imagemap_claims SET claimed = 0, claimed_at = NULL WHERE id = ?";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setInt(1, id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mereset status claim imagemap id " + id, e);
+        }
+        return false;
+    }
+
+    public synchronized Optional<ImageMapClaim> getClaimByOrderId(String orderId) {
+        String sql = "SELECT id, order_id, map_name, player_name, sender_phone, image_url, width, height, claimed, created_at, claimed_at FROM imagemap_claims WHERE order_id = ?";
+        try (PreparedStatement ps = getConnection().prepareStatement(sql)) {
+            ps.setString(1, orderId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    long claimedAtVal = rs.getLong("claimed_at");
+                    Long claimedAt = rs.wasNull() ? null : claimedAtVal;
+                    return Optional.of(new ImageMapClaim(
+                            rs.getInt("id"),
+                            rs.getString("order_id"),
+                            rs.getString("map_name"),
+                            rs.getString("player_name"),
+                            rs.getString("sender_phone"),
+                            rs.getString("image_url"),
+                            rs.getInt("width"),
+                            rs.getInt("height"),
+                            rs.getInt("claimed") == 1,
+                            rs.getLong("created_at"),
+                            claimedAt
+                    ));
+                }
+            }
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Gagal mengambil claim imagemap order: " + orderId, e);
+        }
+        return Optional.empty();
     }
 
     public synchronized void close() {

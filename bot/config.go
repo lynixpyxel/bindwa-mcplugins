@@ -24,6 +24,7 @@ type Config struct {
 	ImageMapPricing      map[string]int `json:"imagemap_pricing"`
 	ImageMapPricePerTile int            `json:"imagemap_price_per_tile"`
 	ImageMapUploadDir    string         `json:"imagemap_upload_dir"`
+	PublicURL            string         `json:"public_url,omitempty"`
 }
 
 func DefaultConfig() Config {

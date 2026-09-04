@@ -53,6 +53,7 @@ type WAMessageData struct {
 }
 
 type WAMessageCallback func(data WAMessageData) bool
+type WABroadcastCallback func(payload interface{}) bool
 
 type cachedGroup struct {
 	name      string
@@ -60,19 +61,20 @@ type cachedGroup struct {
 }
 
 type WAClient struct {
-	client          *whatsmeow.Client
-	container       *sqlstore.Container
-	config          Config
-	configPath      string
-	mu              sync.RWMutex
-	isLoggedIn      bool
-	serverStatus    ServerStatus
-	messageCallback WAMessageCallback
-	groupNames      map[string]cachedGroup
-	groupMu         sync.RWMutex
-	rulesManager    *RulesManager
-	warnManager     *WarnManager
-	welcomeManager  *WelcomeManager
+	client            *whatsmeow.Client
+	container         *sqlstore.Container
+	config            Config
+	configPath        string
+	mu                sync.RWMutex
+	isLoggedIn        bool
+	serverStatus      ServerStatus
+	messageCallback   WAMessageCallback
+	broadcastCallback WABroadcastCallback
+	groupNames        map[string]cachedGroup
+	groupMu           sync.RWMutex
+	rulesManager      *RulesManager
+	warnManager       *WarnManager
+	welcomeManager    *WelcomeManager
 	participantMap    map[string]string
 	participantMu     sync.RWMutex
 	latestLeaderboard []LeaderboardEntry
@@ -126,6 +128,12 @@ func (w *WAClient) SetMessageCallback(cb WAMessageCallback) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.messageCallback = cb
+}
+
+func (w *WAClient) SetBroadcastCallback(cb WABroadcastCallback) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.broadcastCallback = cb
 }
 
 func (w *WAClient) UpdateServerStatus(status ServerStatus) {
@@ -547,6 +555,13 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	}
 
 	if !isCmd {
+		// Cek apakah user sedang ditunggu input Minecraft username untuk order imagemap
+		senderPhone := w.resolveSenderPhone(evt)
+		if order := w.imagemapManager.GetOrderWaitingUsername(senderPhone); order != nil {
+			go w.HandleAssignImageMapUsername(context.Background(), evt, order, text)
+			return
+		}
+
 		// Jika pesan bukan command, cek apakah me-reply pesan dari bot di grup yang terhubung
 		if evt.Info.IsGroup && w.isGroupLinked(chatJID) && w.isReplyingToBot(evt) {
 			w.forwardChatMessageToMC(evt, text)
@@ -560,6 +575,14 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	switch cmd {
 	case "help", "menu":
 		w.replyMenu(evt.Info.Chat, evt)
+
+	case "setuser", "claimuser", "setmc":
+		senderPhone := w.resolveSenderPhone(evt)
+		if order := w.imagemapManager.GetOrderWaitingUsername(senderPhone); order != nil {
+			go w.HandleAssignImageMapUsername(ctx, evt, order, args)
+		} else {
+			_ = w.SendReplyToGroup(ctx, evt.Info.Chat, "Anda tidak memiliki pesanan imagemap yang sedang menunggu input username Minecraft.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+		}
 
 	case "imagemap", "ordermap", "buymap", "orderimg":
 		go w.ProcessImageMapOrder(ctx, evt, args)
@@ -1877,4 +1900,86 @@ func (w *WAClient) Disconnect() {
 	if w.container != nil {
 		_ = w.container.Close()
 	}
+}
+
+// HandleImageMapOrderStatusFromMC menangani konfirmasi dari Minecraft plugin terkait status binding player order imagemap.
+func (w *WAClient) HandleImageMapOrderStatusFromMC(orderID string, bound bool, playerName string) {
+	order := w.imagemapManager.GetOrderByPaymentID(orderID)
+	if order == nil {
+		fmt.Printf("[WA-ImageMap] Order %s dari MC tidak ditemukan\n", orderID)
+		return
+	}
+
+	chatJID, _ := types.ParseJID(order.ChatJID)
+
+	if bound && playerName != "" {
+		w.imagemapManager.AssignPlayerToOrder(order.PaymentID, playerName)
+		msg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
+			"Gambar imagemap '%s' (Order ID: %s) telah diproses ke server Minecraft.\n"+
+			"Akun Minecraft terhubung: *%s*\n\n"+
+			"Silakan login ke server Minecraft dan ketik */getimagemap* untuk mengambil map ke inventory Anda.",
+			order.MapName, order.PaymentID, playerName)
+		_ = w.SendToJID(context.Background(), chatJID, msg)
+	} else {
+		w.imagemapManager.SetOrderWaitingUsername(order.PaymentID)
+		msg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
+			"Gambar imagemap '%s' (Order ID: %s) telah diproses ke server Minecraft.\n"+
+			"Nomor WhatsApp Anda belum terhubung dengan akun Minecraft manapun.\n\n"+
+			"Silakan balas pesan ini dengan *Username Minecraft* Anda agar map dapat diklaim di dalam game.\n"+
+			"(Catatan: Untuk pemain Bedrock, wajib diawali tanda titik, contoh: *.NamaPlayer*)",
+			order.MapName, order.PaymentID)
+		_ = w.SendToJID(context.Background(), chatJID, msg)
+	}
+}
+
+// HandleAssignImageMapUsername memproses input username Minecraft dari pemesan yang belum ter-bind.
+func (w *WAClient) HandleAssignImageMapUsername(ctx context.Context, evt *events.Message, order *ImageMapOrder, usernameInput string) {
+	username := strings.TrimSpace(usernameInput)
+	// Bersihkan prefix jika dikirim via .setuser
+	for _, p := range []string{".setuser", "!setuser", "/setuser", "setuser"} {
+		if strings.HasPrefix(strings.ToLower(username), p) {
+			username = strings.TrimSpace(username[len(p):])
+			break
+		}
+	}
+
+	// Validasi username Minecraft (Java: 2-16 char alfanumerik+underscore; Bedrock: diawali titik lalu 1-16 char)
+	matched, _ := regexp.MatchString(`^\.?[a-zA-Z0-9_]{2,16}$`, username)
+	if !matched {
+		chatJID := evt.Info.Chat
+		_ = w.SendReplyToGroup(ctx, chatJID, "Username Minecraft tidak valid. Panjang harus 2-16 karakter (huruf, angka, garis bawah). Untuk pemain Bedrock diawali tanda titik (contoh: .PlayerBedrock).", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+		return
+	}
+
+	w.imagemapManager.AssignPlayerToOrder(order.PaymentID, username)
+
+	// Kirim penugasan player ke plugin Minecraft via WebSocket
+	if w.broadcastCallback != nil {
+		publicURL := w.config.PublicURL
+		if publicURL == "" {
+			publicURL = fmt.Sprintf("http://192.168.18.67:%d", w.config.HTTPPort)
+		}
+		fileName := order.SavedFileName
+		if fileName == "" {
+			fileName = strings.ToLower(order.MapName) + ".png"
+		}
+		imageURL := fmt.Sprintf("%s/images/%s", strings.TrimSuffix(publicURL, "/"), fileName)
+
+		w.broadcastCallback(map[string]interface{}{
+			"type":         "imagemap_assign_player",
+			"order_id":     order.PaymentID,
+			"map_name":     order.MapName,
+			"player_name":  username,
+			"sender_phone": order.SenderPhone,
+			"image_url":    imageURL,
+			"width":        order.Width,
+			"height":       order.Height,
+		})
+	}
+
+	chatJID := evt.Info.Chat
+	confirmMsg := fmt.Sprintf("Akun Minecraft *%s* berhasil dihubungkan ke imagemap '%s' (Order ID: %s)!\n\n"+
+		"Silakan masuk ke server Minecraft dan ketik */getimagemap* untuk mengambil item map ke inventory Anda.",
+		username, order.MapName, order.PaymentID)
+	_ = w.SendReplyToGroup(ctx, chatJID, confirmMsg, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 }
