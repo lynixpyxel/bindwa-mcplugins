@@ -1494,8 +1494,14 @@ func (w *WAClient) SendMessage(ctx context.Context, phone, message string) error
 }
 
 func (w *WAClient) SendToJID(ctx context.Context, jid types.JID, message string) error {
+	_, err := w.SendToJIDWithID(ctx, jid, message)
+	return err
+}
+
+// SendToJIDWithID mengirim pesan teks ke JID tertentu dan mengembalikan ID pesan yang terkirim.
+func (w *WAClient) SendToJIDWithID(ctx context.Context, jid types.JID, message string) (string, error) {
 	if !w.IsReady() {
-		return ErrWANotConnected
+		return "", ErrWANotConnected
 	}
 
 	msg := &waProto.Message{
@@ -1505,12 +1511,12 @@ func (w *WAClient) SendToJID(ctx context.Context, jid types.JID, message string)
 	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	_, err := w.client.SendMessage(sendCtx, jid, msg)
+	resp, err := w.client.SendMessage(sendCtx, jid, msg)
 	if err != nil {
-		return fmt.Errorf("failed to send wa message: %w", err)
+		return "", fmt.Errorf("failed to send wa message: %w", err)
 	}
 
-	return nil
+	return string(resp.ID), nil
 }
 
 func (w *WAClient) SendWithMentions(ctx context.Context, jid types.JID, message string, mentions []string) error {
@@ -1628,11 +1634,35 @@ func (w *WAClient) DeleteMessage(ctx context.Context, chat types.JID, messageID 
 	if !w.IsReady() || messageID == "" {
 		return ErrWANotConnected
 	}
-	revokeMsg := w.client.BuildRevoke(chat, types.EmptyJID, types.MessageID(messageID))
+
+	targetChat := chat.ToNonAD()
+	var botJID types.JID
+	if w.client != nil && w.client.Store != nil {
+		botJID = w.client.Store.GetJID().ToNonAD()
+	}
+
+	revokeMsg := w.client.BuildRevoke(targetChat, types.EmptyJID, types.MessageID(messageID))
+
+	// Jika pesan berada di dalam grup WhatsApp, MessageKey untuk me-revoke pesan bot HARUS menyertakan Participant (JID bot).
+	// Tanpa participant, aplikasi WhatsApp di HP anggota grup tidak dapat menemukan pesan di database lokal grup.
+	// Sama seperti implementasi Baileys di order-modules.js:
+	// ...(isGroup ? { participant: botJid } : {})
+	if targetChat.Server == types.GroupServer && !botJID.IsEmpty() {
+		if revokeMsg.GetProtocolMessage() != nil && revokeMsg.GetProtocolMessage().GetKey() != nil {
+			revokeMsg.ProtocolMessage.Key.Participant = proto.String(botJID.String())
+		}
+	}
+
 	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	_, err := w.client.SendMessage(sendCtx, chat, revokeMsg)
-	return err
+
+	resp, err := w.client.SendMessage(sendCtx, targetChat, revokeMsg)
+	if err != nil {
+		fmt.Printf("[WA-Revoke] Gagal me-revoke pesan %s di %s: %v\n", messageID, targetChat, err)
+		return err
+	}
+	fmt.Printf("[WA-Revoke] Berhasil mengirim revoke pesan %s di %s (revokeMsgID: %s)\n", messageID, targetChat, resp.ID)
+	return nil
 }
 
 func (w *WAClient) replyMenu(chatJID types.JID, evt *events.Message) {

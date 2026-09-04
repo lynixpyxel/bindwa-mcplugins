@@ -298,6 +298,19 @@ func (m *ImageMapOrderManager) ApproveOrder(paymentID, transactionID string, fin
 	return cancelCh
 }
 
+// SetQRMessageID menyimpan ID pesan QR yang dikirimkan ke pemesan untuk keperluan revoke/delete.
+func (m *ImageMapOrderManager) SetQRMessageID(paymentID, msgID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleanID := strings.ToUpper(strings.TrimSpace(paymentID))
+	order, exists := m.byPaymentID[cleanID]
+	if exists && order != nil {
+		order.QRMessageID = msgID
+		go m.saveTransactionRecord(order)
+	}
+}
+
 // RejectOrder menandai pesanan ditolak oleh admin.
 func (m *ImageMapOrderManager) RejectOrder(paymentID, reason string) {
 	m.mu.Lock()
@@ -1078,10 +1091,17 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 	qrMsgID, err := w.SendImageReplyWithID(ctx, userChatJID, qrPNG, "image/png", paymentCaption, nil)
 	if err != nil {
 		fmt.Printf("[WA-ImageMap] Gagal kirim gambar QR ke %s (%v), fallback teks...\n", order.ChatJID, err)
-		_ = w.SendToJID(ctx, userChatJID, paymentCaption)
+		textMsgID, textErr := w.SendToJIDWithID(ctx, userChatJID, paymentCaption)
+		if textErr == nil {
+			order.QRMessageID = textMsgID
+			w.imagemapManager.SetQRMessageID(order.PaymentID, textMsgID)
+		}
 	} else {
 		order.QRMessageID = qrMsgID
+		w.imagemapManager.SetQRMessageID(order.PaymentID, qrMsgID)
 	}
+
+	fmt.Printf("[WA-ImageMap] QR dikirimkan ke %s untuk order %s (QRMessageID: %s)\n", order.ChatJID, order.PaymentID, order.QRMessageID)
 
 	// Jalankan background payment watcher
 	go w.watchImageMapPayment(order, cancelCh)
@@ -1176,8 +1196,17 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 
 		case <-timeout:
 			// Hapus pesan QR jika masih ada saat kedaluwarsa
-			if order.QRMessageID != "" {
-				_ = w.DeleteMessage(context.Background(), chatJID, order.QRMessageID)
+			qrMsgID := order.QRMessageID
+			if qrMsgID == "" {
+				if latest := w.imagemapManager.GetOrderByPaymentID(order.PaymentID); latest != nil {
+					qrMsgID = latest.QRMessageID
+				}
+			}
+			if qrMsgID != "" {
+				fmt.Printf("[WA-ImageMap] Timeout pembayaran, menghapus pesan QR (ID: %s, chat: %s)...\n", qrMsgID, chatJID)
+				if delErr := w.DeleteMessage(context.Background(), chatJID, qrMsgID); delErr != nil {
+					fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
+				}
 			}
 			w.imagemapManager.CancelOrder(order.PaymentID, "expired")
 			msg := fmt.Sprintf("Waktu Pembayaran Habis\n\n"+
@@ -1201,8 +1230,21 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 			status := strings.ToLower(statusResp.Data.Status)
 			if status == "paid" || status == "success" {
 				// Hapus pesan QR yang dikirimkan ke pemesan karena pembayaran sudah berhasil
-				if order.QRMessageID != "" {
-					_ = w.DeleteMessage(context.Background(), chatJID, order.QRMessageID)
+				qrMsgID := order.QRMessageID
+				if qrMsgID == "" {
+					if latest := w.imagemapManager.GetOrderByPaymentID(order.PaymentID); latest != nil {
+						qrMsgID = latest.QRMessageID
+					}
+				}
+				if qrMsgID != "" {
+					fmt.Printf("[WA-ImageMap] Pembayaran sukses! Menghapus pesan QR (ID: %s, chat: %s)...\n", qrMsgID, chatJID)
+					if delErr := w.DeleteMessage(context.Background(), chatJID, qrMsgID); delErr != nil {
+						fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
+					} else {
+						fmt.Printf("[WA-ImageMap] Pesan QR berhasil dihapus dari %s\n", chatJID)
+					}
+				} else {
+					fmt.Printf("[WA-ImageMap] Peringatan: QRMessageID tidak ditemukan untuk order %s, tidak ada pesan yang dihapus\n", order.PaymentID)
 				}
 
 				uploadDir := w.config.ImageMapUploadDir
@@ -1249,8 +1291,17 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 				return
 			} else if status == "cancel" || status == "expired" {
 				// Hapus pesan QR jika dibatalkan atau kedaluwarsa
-				if order.QRMessageID != "" {
-					_ = w.DeleteMessage(context.Background(), chatJID, order.QRMessageID)
+				qrMsgID := order.QRMessageID
+				if qrMsgID == "" {
+					if latest := w.imagemapManager.GetOrderByPaymentID(order.PaymentID); latest != nil {
+						qrMsgID = latest.QRMessageID
+					}
+				}
+				if qrMsgID != "" {
+					fmt.Printf("[WA-ImageMap] Status pembayaran %s, menghapus pesan QR (ID: %s, chat: %s)...\n", status, qrMsgID, chatJID)
+					if delErr := w.DeleteMessage(context.Background(), chatJID, qrMsgID); delErr != nil {
+						fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
+					}
 				}
 
 				w.imagemapManager.CancelOrder(order.PaymentID, status)
@@ -1275,9 +1326,18 @@ func (w *WAClient) CancelUserPendingOrder(ctx context.Context, evt *events.Messa
 	}
 
 	// Hapus pesan QR jika masih ada
-	if order.QRMessageID != "" {
+	qrMsgID := order.QRMessageID
+	if qrMsgID == "" {
+		if latest := w.imagemapManager.GetOrderByPaymentID(order.PaymentID); latest != nil {
+			qrMsgID = latest.QRMessageID
+		}
+	}
+	if qrMsgID != "" {
 		userChatJID, _ := types.ParseJID(order.ChatJID)
-		_ = w.DeleteMessage(ctx, userChatJID, order.QRMessageID)
+		fmt.Printf("[WA-ImageMap] Order dibatalkan user, menghapus pesan QR (ID: %s, chat: %s)...\n", qrMsgID, userChatJID)
+		if delErr := w.DeleteMessage(ctx, userChatJID, qrMsgID); delErr != nil {
+			fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
+		}
 	}
 
 	if order.TransactionID != "" && w.casakuClient != nil {

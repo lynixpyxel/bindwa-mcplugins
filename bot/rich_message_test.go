@@ -1,12 +1,16 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waAICommon"
 	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -275,5 +279,55 @@ func TestBuildDinoMessage(t *testing.T) {
 	}
 	if rcCtx.GetForwardedAiBotMessageInfo().GetBotJID() != "867051314767696@bot" {
 		t.Errorf("Unexpected BotJID: %s", rcCtx.GetForwardedAiBotMessageInfo().GetBotJID())
+	}
+}
+
+func TestRevokeMessageKeyStructure(t *testing.T) {
+	cli := whatsmeow.NewClient(&store.Device{}, nil)
+	groupJID := types.NewJID("120363000000000000", types.GroupServer)
+	msgID := "3EB0TEST12345"
+
+	revokeMsg := cli.BuildRevoke(groupJID, types.EmptyJID, types.MessageID(msgID))
+	if revokeMsg.GetProtocolMessage() == nil || revokeMsg.GetProtocolMessage().GetKey() == nil {
+		t.Fatalf("Expected ProtocolMessage with Key")
+	}
+
+	key := revokeMsg.GetProtocolMessage().GetKey()
+	if !key.GetFromMe() {
+		t.Errorf("Expected FromMe = true")
+	}
+	if key.GetID() != msgID {
+		t.Errorf("Expected ID = %s, got %s", msgID, key.GetID())
+	}
+	if key.GetRemoteJID() != groupJID.String() {
+		t.Errorf("Expected RemoteJID = %s, got %s", groupJID.String(), key.GetRemoteJID())
+	}
+
+	// For WhatsApp groups, Participant must be set to the bot's JID
+	botJID := types.NewJID("628123456789", types.DefaultUserServer)
+	key.Participant = proto.String(botJID.String())
+
+	if key.GetParticipant() != "628123456789@s.whatsapp.net" {
+		t.Errorf("Expected Participant to be bot JID, got %s", key.GetParticipant())
+	}
+}
+
+func TestImageMapOrderManager_SetQRMessageID(t *testing.T) {
+	mgr := NewImageMapOrderManager(t.TempDir(), filepath.Join(t.TempDir(), "test_orders.json"))
+	order := &ImageMapOrder{
+		PaymentID:   "MAP-TEST99",
+		MapName:     "test",
+		SenderPhone: "628111111",
+		Status:      "awaiting_approval",
+	}
+	mgr.RegisterAwaitingOrder(order)
+
+	mgr.SetQRMessageID("MAP-TEST99", "3EB0QR123")
+	retrieved := mgr.GetOrderByPaymentID("MAP-TEST99")
+	if retrieved == nil {
+		t.Fatalf("Order not found")
+	}
+	if retrieved.QRMessageID != "3EB0QR123" {
+		t.Errorf("Expected QRMessageID = 3EB0QR123, got %s", retrieved.QRMessageID)
 	}
 }
