@@ -30,7 +30,7 @@ type Config struct {
 	APIKey               string         `json:"api_key,omitempty"`
 	PrivateKey           string         `json:"private_key,omitempty"`
 	Mode                 string         `json:"mode,omitempty"`
-	Tripay               TripayConfig   `json:"tripay"`
+	Tripay               TripayConfig   `json:"tripay,omitempty"`
 	ImageMapPricing      map[string]int `json:"imagemap_pricing,omitempty"`
 	ImageMapPricePerTile int            `json:"imagemap_price_per_tile,omitempty"`
 	ImageMapPriceImage   int            `json:"imagemap_price_image"`

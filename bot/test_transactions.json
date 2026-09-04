@@ -1,0 +1,18 @@
+{
+  "MAP-WEBHOOK1": {
+    "payment_id": "MAP-WEBHOOK1",
+    "transaction_id": "DEV-T123456789",
+    "sender_phone": "628123456789",
+    "sender_jid": "",
+    "chat_jid": "628123456789@s.whatsapp.net",
+    "map_name": "testhook",
+    "width": 0,
+    "height": 0,
+    "total_tiles": 0,
+    "amount": 5000,
+    "status": "waiting_mc_username",
+    "saved_file_name": "testhook.png",
+    "created_at": "0001-01-01T00:00:00Z",
+    "updated_at": "2026-09-04T18:53:25.958193095+07:00"
+  }
+}
