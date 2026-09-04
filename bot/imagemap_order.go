@@ -3,17 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
-	_ "image/gif"
+	"image/gif"
 	_ "image/jpeg"
 	"image/png"
 	"io"
 	"net/http"
+	netUrl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -29,150 +34,192 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ── Casaku API Client ────────────────────────────────────────────────────────
+// ── TriPay API Client ────────────────────────────────────────────────────────
 
-type CasakuClient struct {
-	BaseURL    string
-	LicenseKey string
-	QRID       string
-	HTTPClient *http.Client
+type TripayClient struct {
+	BaseURL       string
+	MerchantCode  string
+	APIKey        string
+	PrivateKey    string
+	PaymentMethod string
+	HTTPClient    *http.Client
 }
 
-func NewCasakuClient(baseURL, licenseKey, qrID string) *CasakuClient {
+func NewTripayClient(baseURL, merchantCode, apiKey, privateKey, paymentMethod string) *TripayClient {
 	if baseURL == "" {
-		baseURL = "https://api.casaku.id"
+		baseURL = "https://tripay.co.id/api-sandbox"
 	}
-	return &CasakuClient{
-		BaseURL:    strings.TrimRight(baseURL, "/"),
-		LicenseKey: licenseKey,
-		QRID:       qrID,
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+	if paymentMethod == "" {
+		paymentMethod = "QRIS"
+	}
+	return &TripayClient{
+		BaseURL:       strings.TrimRight(baseURL, "/"),
+		MerchantCode:  merchantCode,
+		APIKey:        apiKey,
+		PrivateKey:    privateKey,
+		PaymentMethod: paymentMethod,
+		HTTPClient:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-type CasakuQRISResponse struct {
-	Status  int    `json:"status"`
-	Message string `json:"message,omitempty"`
-	Data    struct {
-		TransactionID    string `json:"transactionId"`
-		TotalAmount      int    `json:"totalAmount"`
-		QRString         string `json:"qr_string"`
-		ExpiredInMinutes int    `json:"expiredInMinutes"`
-	} `json:"data"`
+// GenerateSignature menghasilkan signature HMAC-SHA256 untuk closed transaction TriPay.
+// Formula resmi: HMAC-SHA256(merchant_code + merchant_ref + amount, private_key)
+func (t *TripayClient) GenerateSignature(merchantRef string, amount int) string {
+	payload := fmt.Sprintf("%s%s%d", t.MerchantCode, merchantRef, amount)
+	h := hmac.New(sha256.New, []byte(t.PrivateKey))
+	h.Write([]byte(payload))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-type CasakuStatusResponse struct {
-	Status  int    `json:"status"`
-	Message string `json:"message,omitempty"`
-	Data    struct {
-		TransactionID string `json:"transactionId"`
-		Status        string `json:"status"` // pending, paid, success, cancel, expired
-		Amount        int    `json:"amount"`
-	} `json:"data"`
+// ValidateCallbackSignature memvalidasi signature HMAC-SHA256 webhook callback dari TriPay.
+func (t *TripayClient) ValidateCallbackSignature(rawBody []byte, expectedSignature string) bool {
+	h := hmac.New(sha256.New, []byte(t.PrivateKey))
+	h.Write(rawBody)
+	calculated := hex.EncodeToString(h.Sum(nil))
+	return hmac.Equal([]byte(calculated), []byte(expectedSignature))
 }
 
-func (c *CasakuClient) GenerateQRIS(ctx context.Context, amount int) (*CasakuQRISResponse, error) {
+type TripayOrderItem struct {
+	SKU      string `json:"sku,omitempty"`
+	Name     string `json:"name"`
+	Price    int    `json:"price"`
+	Quantity int    `json:"quantity"`
+}
+
+type TripayTransactionData struct {
+	Reference      string `json:"reference"`
+	MerchantRef    string `json:"merchant_ref"`
+	PaymentMethod  string `json:"payment_method"`
+	PaymentName    string `json:"payment_name"`
+	CustomerName   string `json:"customer_name"`
+	Amount         int    `json:"amount"`
+	FeeMerchant    int    `json:"fee_merchant"`
+	FeeCustomer    int    `json:"fee_customer"`
+	TotalFee       int    `json:"total_fee"`
+	AmountReceived int    `json:"amount_received"`
+	PayCode        string `json:"pay_code,omitempty"`
+	PayURL         string `json:"pay_url,omitempty"`
+	CheckoutURL    string `json:"checkout_url,omitempty"`
+	Status         string `json:"status"` // UNPAID, PAID, EXPIRED, FAILED, REFUND
+	ExpiredTime    int64  `json:"expired_time"`
+	QRString       string `json:"qr_string,omitempty"`
+	QRURL          string `json:"qr_url,omitempty"`
+}
+
+type TripayCreateResponse struct {
+	Success bool                  `json:"success"`
+	Message string                `json:"message,omitempty"`
+	Data    TripayTransactionData `json:"data"`
+}
+
+type TripayDetailResponse struct {
+	Success bool                  `json:"success"`
+	Message string                `json:"message,omitempty"`
+	Data    TripayTransactionData `json:"data"`
+}
+
+func (t *TripayClient) CreateClosedTransaction(ctx context.Context, merchantRef, mapName string, amount int, customerPhone string) (*TripayCreateResponse, error) {
+	if t.APIKey == "" || t.PrivateKey == "" || t.MerchantCode == "" {
+		return nil, errors.New("konfigurasi TriPay (merchant_code, api_key, private_key) belum lengkap")
+	}
+
+	sig := t.GenerateSignature(merchantRef, amount)
+	expiry := time.Now().Add(15 * time.Minute).Unix()
+
+	custName := customerPhone
+	if custName == "" {
+		custName = "Customer"
+	}
+	custEmail := fmt.Sprintf("%s@customer.bindwa", strings.TrimPrefix(customerPhone, "+"))
+
 	reqBody := map[string]interface{}{
-		"qr_id":            c.QRID,
-		"amount":           amount,
-		"packageIds":       []string{"id.dana"},
-		"qrType":           "dynamic",
-		"paymentMethod":    "qris",
-		"useQris":          true,
-		"useUniqueCode":    true,
-		"expiredInMinutes": 15,
+		"method":         t.PaymentMethod,
+		"merchant_ref":   merchantRef,
+		"amount":         amount,
+		"customer_name":  custName,
+		"customer_email": custEmail,
+		"customer_phone": customerPhone,
+		"order_items": []TripayOrderItem{
+			{
+				SKU:      "MAP-" + mapName,
+				Name:     "ImageMap " + mapName,
+				Price:    amount,
+				Quantity: 1,
+			},
+		},
+		"expired_time": expiry,
+		"signature":    sig,
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal qris request: %w", err)
+		return nil, fmt.Errorf("failed to marshal tripay request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/api/generate/v2/qris", bytes.NewReader(bodyBytes))
+	url := t.BaseURL + "/transaction/create"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create qris request: %w", err)
+		return nil, fmt.Errorf("failed to create tripay request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-license-key", c.LicenseKey)
+	req.Header.Set("Authorization", "Bearer "+t.APIKey)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := t.HTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("casaku request failed: %w", err)
+		return nil, fmt.Errorf("tripay request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var result CasakuQRISResponse
+	var result TripayCreateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode casaku response: %w", err)
+		return nil, fmt.Errorf("failed to decode tripay response: %w", err)
 	}
 
-	if result.Status != 200 || result.Data.QRString == "" {
-		if result.Message != "" {
-			return nil, errors.New(result.Message)
+	if !result.Success {
+		msg := result.Message
+		if msg == "" {
+			msg = fmt.Sprintf("tripay returned HTTP %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("casaku returned HTTP %d", resp.StatusCode)
+		return nil, errors.New(msg)
 	}
 
 	return &result, nil
 }
 
-func (c *CasakuClient) CheckStatus(ctx context.Context, transactionID string) (*CasakuStatusResponse, error) {
-	reqBody := map[string]interface{}{
-		"transactionId": transactionID,
+func (t *TripayClient) CheckTransactionStatus(ctx context.Context, reference string) (*TripayDetailResponse, error) {
+	if t.APIKey == "" {
+		return nil, errors.New("konfigurasi TriPay (api_key) belum diatur")
 	}
 
-	bodyBytes, err := json.Marshal(reqBody)
+	url := fmt.Sprintf("%s/transaction/detail?reference=%s", t.BaseURL, netUrl.QueryEscape(reference))
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create tripay detail request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/api/generate/check-status", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
+	req.Header.Set("Authorization", "Bearer "+t.APIKey)
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-license-key", c.LicenseKey)
-
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := t.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tripay detail request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var result CasakuStatusResponse
+	var result TripayDetailResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode tripay detail response: %w", err)
+	}
+
+	if !result.Success {
+		msg := result.Message
+		if msg == "" {
+			msg = fmt.Sprintf("tripay detail returned HTTP %d", resp.StatusCode)
+		}
+		return nil, errors.New(msg)
 	}
 
 	return &result, nil
-}
-
-func (c *CasakuClient) CancelPayment(ctx context.Context, transactionID string) error {
-	reqBody := map[string]interface{}{
-		"transactionId": transactionID,
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/api/generate/cancel-status", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-license-key", c.LicenseKey)
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return nil
 }
 
 // ── ImageMap Order Models & Store ────────────────────────────────────────────
@@ -186,6 +233,7 @@ type ImageMapOrder struct {
 	OriginalMsgID string    `json:"original_msg_id,omitempty"`
 	QRMessageID   string    `json:"qr_message_id,omitempty"`
 	MapName       string    `json:"map_name"`
+	MediaType     string    `json:"media_type,omitempty"` // "image" or "gif"
 	Width         int       `json:"width"`
 	Height        int       `json:"height"`
 	TotalTiles    int       `json:"total_tiles"`
@@ -276,7 +324,20 @@ func (m *ImageMapOrderManager) GetOrderByPaymentID(paymentID string) *ImageMapOr
 	return m.byPaymentID[cleanID]
 }
 
-// ApproveOrder menandai pesanan disetujui admin dan mendaftarkan transactionID Casaku untuk pemantauan pembayaran.
+// GetOrderByTransactionID mengambil data order berdasarkan reference / Transaction ID.
+func (m *ImageMapOrderManager) GetOrderByTransactionID(trxID string) *ImageMapOrder {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cleanID := strings.TrimSpace(trxID)
+	for _, o := range m.byPaymentID {
+		if strings.EqualFold(o.TransactionID, cleanID) {
+			return o
+		}
+	}
+	return nil
+}
+
+// ApproveOrder menandai pesanan disetujui admin dan mendaftarkan transactionID TriPay untuk pemantauan pembayaran.
 func (m *ImageMapOrderManager) ApproveOrder(paymentID, transactionID string, finalAmount int) chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -351,7 +412,10 @@ func (m *ImageMapOrderManager) CompleteOrder(paymentID string, savedFileName str
 	cleanName := strings.ToLower(strings.TrimSpace(order.MapName))
 	delete(m.activeOrders, cleanName)
 	if order.TransactionID != "" {
-		delete(m.cancelChans, order.TransactionID)
+		if ch, ok := m.cancelChans[order.TransactionID]; ok {
+			close(ch)
+			delete(m.cancelChans, order.TransactionID)
+		}
 	}
 
 	go m.saveTransactionRecord(order)
@@ -551,48 +615,167 @@ func ParseImageMapArgs(rawArgs string, hasMedia bool) (imgURL, mapName string, w
 
 // ── Image Extraction & Normalization ─────────────────────────────────────────
 
-// ExtractImageFromEvent mengunduh atau mengekstrak data gambar dari pesan WhatsApp (caption, quoted, atau URL).
-func ExtractImageFromEvent(ctx context.Context, client *whatsmeow.Client, evt *events.Message, urlStr string) ([]byte, error) {
+// isGIFBytes memeriksa apakah byte diawali header magic number GIF (GIF87a / GIF89a).
+func isGIFBytes(data []byte) bool {
+	return len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a")
+}
+
+// ValidateGIF memvalidasi file GIF dan memastikan dapat dibaca frame-framenya.
+func ValidateGIF(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("file GIF kosong")
+	}
+	if !isGIFBytes(data) {
+		return errors.New("bukan format GIF yang valid")
+	}
+	_, err := gif.DecodeAll(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("file GIF rusak atau tidak dapat dibaca: %w", err)
+	}
+	return nil
+}
+
+// convertVideoToGIF mengonversi video WhatsApp (MP4) ke file GIF animasi menggunakan ffmpeg.
+func convertVideoToGIF(ctx context.Context, vidBytes []byte) ([]byte, error) {
+	if len(vidBytes) == 0 {
+		return nil, errors.New("data video GIF kosong")
+	}
+
+	tmpFile, err := os.CreateTemp("", "wagif_in_*.mp4")
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuat file temp video: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(vidBytes); err != nil {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("gagal menulis video ke file temp: %w", err)
+	}
+	_ = tmpFile.Close()
+
+	outPath := filepath.Join(os.TempDir(), fmt.Sprintf("wagif_out_%d.gif", time.Now().UnixNano()))
+	defer os.Remove(outPath)
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", tmpFile.Name(),
+		"-vf", "fps=10,scale=min(iw\\,320):-1:flags=lanczos",
+		"-c:v", "gif", outPath)
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("gagal mengonversi video ke GIF: %w (log: %s)", err, string(output))
+	}
+
+	gifBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membaca output GIF: %w", err)
+	}
+	if len(gifBytes) == 0 {
+		return nil, errors.New("hasil konversi animasi GIF kosong")
+	}
+
+	return gifBytes, nil
+}
+
+// ExtractImageFromEvent mengunduh atau mengekstrak data gambar/GIF dari pesan WhatsApp (caption, quoted, atau URL).
+// Mengembalikan (mediaBytes, mediaType ("image"|"gif"), error).
+func ExtractImageFromEvent(ctx context.Context, client *whatsmeow.Client, evt *events.Message, urlStr string) ([]byte, string, error) {
 	// 1. Jika ada URL gambar langsung
 	if urlStr != "" {
 		req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 		if err != nil {
-			return nil, fmt.Errorf("URL tidak valid: %w", err)
+			return nil, "", fmt.Errorf("URL tidak valid: %w", err)
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; CSMPImageMapBot/1.0)")
 
-		clientHTTP := &http.Client{Timeout: 15 * time.Second}
+		clientHTTP := &http.Client{Timeout: 20 * time.Second}
 		resp, err := clientHTTP.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("gagal mengunduh gambar dari link: %w", err)
+			return nil, "", fmt.Errorf("gagal mengunduh gambar/GIF dari link: %w", err)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("link gambar mengembalikan HTTP %d", resp.StatusCode)
+			return nil, "", fmt.Errorf("link gambar/GIF mengembalikan HTTP %d", resp.StatusCode)
 		}
 
-		imgBytes, err := io.ReadAll(io.LimitReader(resp.Body, 15*1024*1024)) // max 15MB
+		rawBytes, err := io.ReadAll(io.LimitReader(resp.Body, 15*1024*1024)) // max 15MB
 		if err != nil {
-			return nil, fmt.Errorf("gagal membaca data gambar dari link: %w", err)
+			return nil, "", fmt.Errorf("gagal membaca data media dari link: %w", err)
 		}
-		return ValidateAndConvertToPNG(imgBytes)
+
+		isGIF := strings.HasSuffix(strings.ToLower(urlStr), ".gif") ||
+			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "gif") ||
+			isGIFBytes(rawBytes)
+
+		if isGIF {
+			if err := ValidateGIF(rawBytes); err != nil {
+				return nil, "", err
+			}
+			return rawBytes, "gif", nil
+		}
+
+		pngBytes, err := ValidateAndConvertToPNG(rawBytes)
+		if err != nil {
+			return nil, "", err
+		}
+		return pngBytes, "image", nil
 	}
 
 	if client == nil || evt == nil || evt.Message == nil {
-		return nil, errors.New("pesan tidak mengandung gambar")
+		return nil, "", errors.New("pesan tidak mengandung gambar ataupun GIF")
 	}
 
-	// 2. Cek jika pesan saat ini adalah gambar (Direct Image Caption)
+	// 2. Cek pesan saat ini (Direct Media)
 	if imgMsg := evt.Message.GetImageMessage(); imgMsg != nil {
 		imgBytes, err := client.Download(ctx, imgMsg)
 		if err != nil {
-			return nil, fmt.Errorf("gagal mengunduh foto dari WhatsApp: %w", err)
+			return nil, "", fmt.Errorf("gagal mengunduh foto dari WhatsApp: %w", err)
 		}
-		return ValidateAndConvertToPNG(imgBytes)
+		if isGIFBytes(imgBytes) {
+			if err := ValidateGIF(imgBytes); err == nil {
+				return imgBytes, "gif", nil
+			}
+		}
+		pngBytes, err := ValidateAndConvertToPNG(imgBytes)
+		if err != nil {
+			return nil, "", err
+		}
+		return pngBytes, "image", nil
 	}
 
-	// 3. Cek jika me-reply pesan gambar (Quoted Image)
+	if vidMsg := evt.Message.GetVideoMessage(); vidMsg != nil {
+		vidBytes, err := client.Download(ctx, vidMsg)
+		if err != nil {
+			return nil, "", fmt.Errorf("gagal mengunduh GIF/video dari WhatsApp: %w", err)
+		}
+		gifBytes, err := convertVideoToGIF(ctx, vidBytes)
+		if err != nil {
+			return nil, "", err
+		}
+		return gifBytes, "gif", nil
+	}
+
+	if docMsg := evt.Message.GetDocumentMessage(); docMsg != nil {
+		docBytes, err := client.Download(ctx, docMsg)
+		if err != nil {
+			return nil, "", fmt.Errorf("gagal mengunduh dokumen dari WhatsApp: %w", err)
+		}
+		isGIF := strings.HasSuffix(strings.ToLower(docMsg.GetFileName()), ".gif") ||
+			strings.Contains(strings.ToLower(docMsg.GetMimetype()), "gif") ||
+			isGIFBytes(docBytes)
+		if isGIF {
+			if err := ValidateGIF(docBytes); err != nil {
+				return nil, "", err
+			}
+			return docBytes, "gif", nil
+		}
+		pngBytes, err := ValidateAndConvertToPNG(docBytes)
+		if err != nil {
+			return nil, "", err
+		}
+		return pngBytes, "image", nil
+	}
+
+	// 3. Cek jika me-reply pesan (Quoted Media)
 	var ctxInfo *waProto.ContextInfo
 	if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
 		ctxInfo = ext.GetContextInfo()
@@ -603,13 +786,55 @@ func ExtractImageFromEvent(ctx context.Context, client *whatsmeow.Client, evt *e
 		if qImg := qm.GetImageMessage(); qImg != nil {
 			imgBytes, err := client.Download(ctx, qImg)
 			if err != nil {
-				return nil, fmt.Errorf("gagal mengunduh foto yang di-quote: %w", err)
+				return nil, "", fmt.Errorf("gagal mengunduh foto yang di-quote: %w", err)
 			}
-			return ValidateAndConvertToPNG(imgBytes)
+			if isGIFBytes(imgBytes) {
+				if err := ValidateGIF(imgBytes); err == nil {
+					return imgBytes, "gif", nil
+				}
+			}
+			pngBytes, err := ValidateAndConvertToPNG(imgBytes)
+			if err != nil {
+				return nil, "", err
+			}
+			return pngBytes, "image", nil
+		}
+
+		if qVid := qm.GetVideoMessage(); qVid != nil {
+			vidBytes, err := client.Download(ctx, qVid)
+			if err != nil {
+				return nil, "", fmt.Errorf("gagal mengunduh GIF/video yang di-quote: %w", err)
+			}
+			gifBytes, err := convertVideoToGIF(ctx, vidBytes)
+			if err != nil {
+				return nil, "", err
+			}
+			return gifBytes, "gif", nil
+		}
+
+		if qDoc := qm.GetDocumentMessage(); qDoc != nil {
+			docBytes, err := client.Download(ctx, qDoc)
+			if err != nil {
+				return nil, "", fmt.Errorf("gagal mengunduh dokumen yang di-quote: %w", err)
+			}
+			isGIF := strings.HasSuffix(strings.ToLower(qDoc.GetFileName()), ".gif") ||
+				strings.Contains(strings.ToLower(qDoc.GetMimetype()), "gif") ||
+				isGIFBytes(docBytes)
+			if isGIF {
+				if err := ValidateGIF(docBytes); err != nil {
+					return nil, "", err
+				}
+				return docBytes, "gif", nil
+			}
+			pngBytes, err := ValidateAndConvertToPNG(docBytes)
+			if err != nil {
+				return nil, "", err
+			}
+			return pngBytes, "image", nil
 		}
 	}
 
-	return nil, errors.New("tidak ditemukan gambar pada pesan ataupun pesan yang di-reply")
+	return nil, "", errors.New("tidak ditemukan gambar atau GIF pada pesan ataupun pesan yang di-reply")
 }
 
 // ValidateAndConvertToPNG memvalidasi bahwa byte adalah gambar yang valid dan mengonversinya ke format PNG murni.
@@ -924,13 +1149,21 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 	chatJID := evt.Info.Chat
 	senderPhone := w.resolveSenderPhone(evt)
 
-	// Deteksi apakah pesan menyertakan gambar langsung atau me-reply gambar
+	// Deteksi apakah pesan menyertakan gambar/GIF langsung atau me-reply gambar/GIF
 	isDirectImg := evt.Message.GetImageMessage() != nil
+	isDirectVid := evt.Message.GetVideoMessage() != nil
+	isDirectDoc := evt.Message.GetDocumentMessage() != nil
 	isQuotedImg := false
+	isQuotedVid := false
+	isQuotedDoc := false
+
 	if ext := evt.Message.GetExtendedTextMessage(); ext != nil && ext.GetContextInfo() != nil && ext.GetContextInfo().GetQuotedMessage() != nil {
-		isQuotedImg = ext.GetContextInfo().GetQuotedMessage().GetImageMessage() != nil
+		qm := ext.GetContextInfo().GetQuotedMessage()
+		isQuotedImg = qm.GetImageMessage() != nil
+		isQuotedVid = qm.GetVideoMessage() != nil
+		isQuotedDoc = qm.GetDocumentMessage() != nil
 	}
-	hasMedia := isDirectImg || isQuotedImg
+	hasMedia := isDirectImg || isQuotedImg || isDirectVid || isQuotedVid || isDirectDoc || isQuotedDoc
 
 	imgURL, mapName, width, height, err := ParseImageMapArgs(rawArgs, hasMedia)
 	if err != nil {
@@ -967,24 +1200,25 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 		return
 	}
 
-	// 3. Ekstrak dan konversi gambar ke PNG
-	downloadCtx, cancelDownload := context.WithTimeout(ctx, 25*time.Second)
+	// 3. Ekstrak dan konversi gambar/GIF
+	downloadCtx, cancelDownload := context.WithTimeout(ctx, 40*time.Second)
 	defer cancelDownload()
 
-	imgBytes, err := ExtractImageFromEvent(downloadCtx, w.client, evt, imgURL)
+	imgBytes, mediaType, err := ExtractImageFromEvent(downloadCtx, w.client, evt, imgURL)
 	if err != nil {
-		replyMsg := fmt.Sprintf("Gagal memproses gambar: %s", err.Error())
+		replyMsg := fmt.Sprintf("Gagal memproses gambar/GIF: %s", err.Error())
 		_ = w.SendReplyToGroup(ctx, chatJID, replyMsg, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
 
-	// 4. Hitung harga map
+	// 4. Hitung harga map (flat: Image 5k, GIF 7k)
+	isGIF := mediaType == "gif"
 	totalTiles := width * height
-	totalPrice := w.config.CalculateImageMapPrice(width, height)
+	totalPrice := w.config.CalculateImageMapPrice(width, height, isGIF)
 
-	// 5. Cek kelengkapan konfigurasi Casaku
-	if w.casakuClient == nil || w.casakuClient.LicenseKey == "" || w.casakuClient.QRID == "" {
-		replyMsg := "Layanan pembayaran Casaku QRIS belum dikonfigurasi oleh pemilik bot. Silakan hubungi admin."
+	// 5. Cek kelengkapan konfigurasi TriPay
+	if w.tripayClient == nil || w.tripayClient.APIKey == "" || w.tripayClient.PrivateKey == "" || w.tripayClient.MerchantCode == "" {
+		replyMsg := "Layanan pembayaran TriPay belum dikonfigurasi oleh pemilik bot. Silakan hubungi admin."
 		_ = w.SendReplyToGroup(ctx, chatJID, replyMsg, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
@@ -1000,6 +1234,7 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 		ChatJID:       chatJID.String(),
 		OriginalMsgID: string(evt.Info.ID),
 		MapName:       mapName,
+		MediaType:     mediaType,
 		Width:         width,
 		Height:        height,
 		TotalTiles:    totalTiles,
@@ -1012,16 +1247,22 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 
 	w.imagemapManager.RegisterAwaitingOrder(order)
 
+	typeLabel := "Gambar Biasa"
+	if order.MediaType == "gif" {
+		typeLabel = "GIF Animasi"
+	}
+
 	// 7. Beritahu pemesan bahwa pesanan sedang menunggu persetujuan admin
 	userAckMsg := fmt.Sprintf("Pesanan imagemap telah diterima dan sedang menunggu persetujuan admin.\n\n"+
 		"Rincian Pesanan:\n"+
 		"Order ID    : %s\n"+
 		"Nama Map    : %s\n"+
+		"Tipe        : %s\n"+
 		"Ukuran      : %dx%d (%d tile)\n"+
 		"Total Biaya : Rp %s\n\n"+
 		"Mohon tunggu hingga admin menyetujui pesanan Anda sebelum melakukan pembayaran.\n"+
 		"Ketik .cancelmap jika ingin membatalkan pesanan ini.",
-		order.PaymentID, order.MapName, order.Width, order.Height, order.TotalTiles, formatRupiah(order.Amount))
+		order.PaymentID, order.MapName, typeLabel, order.Width, order.Height, order.TotalTiles, formatRupiah(order.Amount))
 
 	_ = w.SendReplyToGroup(ctx, chatJID, userAckMsg, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 
@@ -1036,6 +1277,7 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 		"Order ID    : %s\n"+
 		"Pengirim    : %s\n"+
 		"Nama Map    : %s\n"+
+		"Tipe        : %s\n"+
 		"Ukuran      : %dx%d (%d tile)\n"+
 		"Total Biaya : Rp %s\n"+
 		"Asal Chat   : %s\n\n"+
@@ -1047,13 +1289,19 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 		"- .acc %s\n"+
 		"- .decline %s [alasan]",
 		order.PaymentID, order.SenderPhone, order.MapName,
+		typeLabel,
 		order.Width, order.Height, order.TotalTiles,
 		formatRupiah(order.Amount), originName,
 		order.PaymentID, order.PaymentID)
 
+	modMime := "image/png"
+	if order.MediaType == "gif" {
+		modMime = "image/gif"
+	}
+
 	targets := w.getModerationTargets()
 	for _, target := range targets {
-		if err := w.SendImageReply(ctx, target, imgBytes, "image/png", modCaption, nil); err != nil {
+		if err := w.SendImageReply(ctx, target, imgBytes, modMime, modCaption, nil); err != nil {
 			fmt.Printf("[WA-Moderation] Gagal mengirim pesan moderasi ke %s: %v\n", target.String(), err)
 		}
 	}
@@ -1094,32 +1342,66 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 		return
 	}
 
-	if w.casakuClient == nil || w.casakuClient.LicenseKey == "" || w.casakuClient.QRID == "" {
-		_ = w.SendReplyToGroup(ctx, chatJID, "Layanan pembayaran Casaku QRIS belum dikonfigurasi. Hubungi pemilik bot.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+	if w.tripayClient == nil || w.tripayClient.APIKey == "" || w.tripayClient.MerchantCode == "" || w.tripayClient.PrivateKey == "" {
+		_ = w.SendReplyToGroup(ctx, chatJID, "Layanan pembayaran TriPay belum dikonfigurasi. Hubungi pemilik bot.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
 
-	// Generate QRIS via Casaku
-	qrisResp, err := w.casakuClient.GenerateQRIS(ctx, order.Amount)
+	// Generate transaksi tertutup via TriPay
+	tripayResp, err := w.tripayClient.CreateClosedTransaction(ctx, order.PaymentID, order.MapName, order.Amount, order.SenderPhone)
 	if err != nil {
-		_ = w.SendReplyToGroup(ctx, chatJID, fmt.Sprintf("Gagal membuat QRIS Casaku: %s", err.Error()), string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+		_ = w.SendReplyToGroup(ctx, chatJID, fmt.Sprintf("Gagal membuat QRIS TriPay: %s", err.Error()), string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
 
-	// Render QR Code PNG
-	qrPNG, err := qrcode.Encode(qrisResp.Data.QRString, qrcode.Medium, 512)
-	if err != nil {
-		_ = w.SendReplyToGroup(ctx, chatJID, fmt.Sprintf("Gagal membuat gambar QR Code: %s", err.Error()), string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
-		return
+	// Render QR Code PNG dari QRString TriPay
+	qrString := tripayResp.Data.QRString
+	if qrString == "" {
+		qrString = tripayResp.Data.QRURL
+	}
+	if qrString == "" {
+		qrString = tripayResp.Data.CheckoutURL
 	}
 
-	cancelCh := w.imagemapManager.ApproveOrder(order.PaymentID, qrisResp.Data.TransactionID, qrisResp.Data.TotalAmount)
+	var qrPNG []byte
+	if qrString != "" {
+		qrPNG, err = qrcode.Encode(qrString, qrcode.Medium, 512)
+		if err != nil {
+			_ = w.SendReplyToGroup(ctx, chatJID, fmt.Sprintf("Gagal membuat gambar QR Code: %s", err.Error()), string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+			return
+		}
+	}
+
+	finalAmount := tripayResp.Data.Amount
+	if finalAmount <= 0 {
+		finalAmount = order.Amount
+	}
+
+	cancelCh := w.imagemapManager.ApproveOrder(order.PaymentID, tripayResp.Data.Reference, finalAmount)
+
+	// Hitung batas waktu dalam menit
+	expiredMinutes := 15
+	if tripayResp.Data.ExpiredTime > 0 {
+		diff := time.Until(time.Unix(tripayResp.Data.ExpiredTime, 0))
+		if diff > 0 {
+			expiredMinutes = int((diff + 59*time.Second) / time.Minute)
+			if expiredMinutes < 1 {
+				expiredMinutes = 1
+			}
+		}
+	}
 
 	// Kirim QRIS dan instruksi pembayaran ke pemesan (pesan gambar biasa)
 	userChatJID, _ := types.ParseJID(order.ChatJID)
+	typeLabel := "Gambar Biasa"
+	if order.MediaType == "gif" {
+		typeLabel = "GIF Animasi"
+	}
+
 	paymentCaption := fmt.Sprintf("Pesanan imagemap Anda telah disetujui oleh admin.\n\n"+
 		"Rincian Pembayaran:\n"+
 		"Nama Map    : %s\n"+
+		"Tipe        : %s\n"+
 		"Ukuran      : %dx%d (%d tile)\n"+
 		"Total Bayar : Rp %s\n"+
 		"Payment ID  : %s\n"+
@@ -1127,22 +1409,30 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 		"Instruksi Pembayaran:\n"+
 		"1. Scan QRIS di atas menggunakan m-Banking atau e-Wallet (BCA, DANA, GoPay, OVO, ShopeePay, dll).\n"+
 		"2. Pastikan nominal transfer sesuai dengan total pembayaran di atas.\n"+
-		"3. Setelah pembayaran berhasil diverifikasi, sistem akan otomatis menyimpan file gambar ke server.\n\n"+
+		"3. Setelah pembayaran berhasil diverifikasi, sistem akan otomatis menyimpan file media ke server.\n\n"+
 		"Ketik .cancelmap jika ingin membatalkan pesanan ini.",
-		order.MapName, order.Width, order.Height, order.TotalTiles,
-		formatRupiah(qrisResp.Data.TotalAmount), order.PaymentID, qrisResp.Data.ExpiredInMinutes)
+		order.MapName, typeLabel, order.Width, order.Height, order.TotalTiles,
+		formatRupiah(finalAmount), order.PaymentID, expiredMinutes)
 
-	qrMsgID, err := w.SendImageReplyWithID(ctx, userChatJID, qrPNG, "image/png", paymentCaption, nil)
-	if err != nil {
-		fmt.Printf("[WA-ImageMap] Gagal kirim gambar QR ke %s (%v), fallback teks...\n", order.ChatJID, err)
+	if len(qrPNG) > 0 {
+		qrMsgID, err := w.SendImageReplyWithID(ctx, userChatJID, qrPNG, "image/png", paymentCaption, nil)
+		if err != nil {
+			fmt.Printf("[WA-ImageMap] Gagal kirim gambar QR ke %s (%v), fallback teks...\n", order.ChatJID, err)
+			textMsgID, textErr := w.SendToJIDWithID(ctx, userChatJID, paymentCaption)
+			if textErr == nil {
+				order.QRMessageID = textMsgID
+				w.imagemapManager.SetQRMessageID(order.PaymentID, textMsgID)
+			}
+		} else {
+			order.QRMessageID = qrMsgID
+			w.imagemapManager.SetQRMessageID(order.PaymentID, qrMsgID)
+		}
+	} else {
 		textMsgID, textErr := w.SendToJIDWithID(ctx, userChatJID, paymentCaption)
 		if textErr == nil {
 			order.QRMessageID = textMsgID
 			w.imagemapManager.SetQRMessageID(order.PaymentID, textMsgID)
 		}
-	} else {
-		order.QRMessageID = qrMsgID
-		w.imagemapManager.SetQRMessageID(order.PaymentID, qrMsgID)
 	}
 
 	fmt.Printf("[WA-ImageMap] QR dikirimkan ke %s untuk order %s (QRMessageID: %s)\n", order.ChatJID, order.PaymentID, order.QRMessageID)
@@ -1152,7 +1442,7 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 
 	// Konfirmasi ke admin / log grup
 	adminConfirm := fmt.Sprintf("Pesanan imagemap %s (%s) telah disetujui.\nQRIS pembayaran sebesar Rp %s telah dikirimkan ke pemesan (%s).",
-		order.PaymentID, order.MapName, formatRupiah(qrisResp.Data.TotalAmount), order.SenderPhone)
+		order.PaymentID, order.MapName, formatRupiah(finalAmount), order.SenderPhone)
 	_ = w.SendReplyToGroup(ctx, chatJID, adminConfirm, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 }
 
@@ -1224,18 +1514,161 @@ func (w *WAClient) HandleDeclineImageMap(ctx context.Context, evt *events.Messag
 	_ = w.SendToJID(ctx, userChatJID, userMsg)
 }
 
-// watchImageMapPayment memantau status pembayaran di Casaku secara berkala.
+// processImageMapPaymentSuccess mengeksekusi penyelesaian pesanan imagemap yang sudah terbayar (idempotent).
+func (w *WAClient) processImageMapPaymentSuccess(order *ImageMapOrder) bool {
+	if order == nil {
+		return false
+	}
+
+	// Ambil data terbaru dari store
+	current := w.imagemapManager.GetOrderByPaymentID(order.PaymentID)
+	if current == nil {
+		current = order
+	}
+	if current.Status == "paid" || current.Status == "waiting_mc_username" {
+		// Sudah diproses sebelumnya
+		return false
+	}
+
+	chatJID, _ := types.ParseJID(current.ChatJID)
+
+	// Hapus pesan QR yang dikirimkan ke pemesan karena pembayaran sudah berhasil
+	qrMsgID := current.QRMessageID
+	if qrMsgID == "" && order.QRMessageID != "" {
+		qrMsgID = order.QRMessageID
+	}
+	if qrMsgID != "" {
+		fmt.Printf("[WA-ImageMap] Pembayaran sukses! Menghapus pesan QR (ID: %s, chat: %s)...\n", qrMsgID, chatJID)
+		if delErr := w.DeleteMessage(context.Background(), chatJID, qrMsgID); delErr != nil {
+			fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
+		} else {
+			fmt.Printf("[WA-ImageMap] Pesan QR berhasil dihapus dari %s\n", chatJID)
+		}
+	} else {
+		fmt.Printf("[WA-ImageMap] Peringatan: QRMessageID tidak ditemukan untuk order %s, tidak ada pesan yang dihapus\n", current.PaymentID)
+	}
+
+	uploadDir := w.config.ImageMapUploadDir
+	if uploadDir == "" {
+		uploadDir = "upload/images"
+	}
+	_ = os.MkdirAll(uploadDir, 0755)
+
+	ext := ".png"
+	if current.MediaType == "gif" {
+		ext = ".gif"
+	}
+	fileName := strings.ToLower(current.MapName) + ext
+	filePath := filepath.Join(uploadDir, fileName)
+
+	if len(current.ImageData) > 0 {
+		if err := os.WriteFile(filePath, current.ImageData, 0644); err != nil {
+			fmt.Printf("[WA-ImageMap] Gagal menyimpan file %s: %v\n", filePath, err)
+		}
+	}
+
+	_ = w.imagemapManager.CompleteOrder(current.PaymentID, fileName)
+
+	// Kirim event WebSocket ke server Minecraft
+	publicURL := w.config.PublicURL
+	if publicURL == "" {
+		publicURL = fmt.Sprintf("http://192.168.18.67:%d", w.config.HTTPPort)
+	}
+	imageURL := fmt.Sprintf("%s/images/%s", strings.TrimSuffix(publicURL, "/"), fileName)
+
+	broadcasted := false
+	if w.broadcastCallback != nil {
+		broadcasted = w.broadcastCallback(map[string]interface{}{
+			"type":         "imagemap_paid",
+			"order_id":     current.PaymentID,
+			"map_name":     current.MapName,
+			"media_type":   current.MediaType,
+			"width":        current.Width,
+			"height":       current.Height,
+			"sender_phone": current.SenderPhone,
+			"image_path":   "/images/" + fileName,
+			"image_url":    imageURL,
+		})
+	}
+
+	typeLabel := "Gambar Biasa"
+	if current.MediaType == "gif" {
+		typeLabel = "GIF Animasi"
+	}
+
+	if !broadcasted {
+		// Fallback jika belum tersambung ke WebSocket Minecraft plugin
+		w.imagemapManager.SetOrderWaitingUsername(current.PaymentID)
+		fallbackMsg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
+			"Rincian Pesanan:\n"+
+			"Nama Map    : %s\n"+
+			"Tipe        : %s\n"+
+			"Ukuran      : %dx%d (%d tile)\n"+
+			"Total Bayar : Rp %s\n"+
+			"Payment ID  : %s\n\n"+
+			"Media telah tersimpan di server. Silakan balas pesan ini dengan Username Minecraft Anda agar map dapat diklaim di dalam game.\n"+
+			"(Catatan: Untuk pemain Bedrock, wajib diawali tanda titik, contoh: *.NamaPlayer*)",
+			current.MapName, typeLabel, current.Width, current.Height, current.TotalTiles,
+			formatRupiah(current.Amount), current.PaymentID)
+		_ = w.SendToJID(context.Background(), chatJID, fallbackMsg)
+	}
+
+	// Beritahu juga grup log
+	logNotice := fmt.Sprintf("Pembayaran Terverifikasi\n\n"+
+		"Order ID    : %s\n"+
+		"Nama Map    : %s\n"+
+		"Tipe        : %s\n"+
+		"Ukuran      : %dx%d (%d tile)\n"+
+		"Pemesan     : %s\n"+
+		"Total       : Rp %s",
+		current.PaymentID, current.MapName,
+		typeLabel,
+		current.Width, current.Height, current.TotalTiles,
+		current.SenderPhone,
+		formatRupiah(current.Amount))
+	for _, target := range w.getModerationTargets() {
+		_ = w.SendToJID(context.Background(), target, logNotice)
+	}
+
+	return true
+}
+
+// HandleTripayPaymentCallback menangani notifikasi webhook pembayaran dari TriPay.
+func (w *WAClient) HandleTripayPaymentCallback(merchantRef, reference string) error {
+	var order *ImageMapOrder
+	if merchantRef != "" {
+		order = w.imagemapManager.GetOrderByPaymentID(merchantRef)
+	}
+	if order == nil && reference != "" {
+		order = w.imagemapManager.GetOrderByTransactionID(reference)
+	}
+
+	if order == nil {
+		return fmt.Errorf("order not found for ref=%s reference=%s", merchantRef, reference)
+	}
+
+	fmt.Printf("[WA-ImageMap] Webhook TriPay callback diterima untuk order %s (Reference: %s)\n", order.PaymentID, reference)
+	w.processImageMapPaymentSuccess(order)
+	return nil
+}
+
+// GetTripayClient mengembalikan pointer instance TripayClient.
+func (w *WAClient) GetTripayClient() *TripayClient {
+	return w.tripayClient
+}
+
+// watchImageMapPayment memantau status pembayaran di TriPay secara berkala.
 func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan struct{}) {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(4 * time.Second)
 	defer ticker.Stop()
 
-	timeout := time.After(15 * time.Minute)
+	timeout := time.After(16 * time.Minute)
 	chatJID, _ := types.ParseJID(order.ChatJID)
 
 	for {
 		select {
 		case <-cancelCh:
-			fmt.Printf("[WA-ImageMap] Watcher dihentikan untuk order %s (dibatalkan)\n", order.PaymentID)
+			fmt.Printf("[WA-ImageMap] Watcher dihentikan untuk order %s\n", order.PaymentID)
 			return
 
 		case <-timeout:
@@ -1259,8 +1692,12 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 			return
 
 		case <-ticker.C:
+			if w.tripayClient == nil || order.TransactionID == "" {
+				continue
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			statusResp, err := w.casakuClient.CheckStatus(ctx, order.TransactionID)
+			statusResp, err := w.tripayClient.CheckTransactionStatus(ctx, order.TransactionID)
 			cancel()
 
 			if err != nil {
@@ -1271,93 +1708,11 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 				continue
 			}
 
-			status := strings.ToLower(statusResp.Data.Status)
-			if status == "paid" || status == "success" {
-				// Hapus pesan QR yang dikirimkan ke pemesan karena pembayaran sudah berhasil
-				qrMsgID := order.QRMessageID
-				if qrMsgID == "" {
-					if latest := w.imagemapManager.GetOrderByPaymentID(order.PaymentID); latest != nil {
-						qrMsgID = latest.QRMessageID
-					}
-				}
-				if qrMsgID != "" {
-					fmt.Printf("[WA-ImageMap] Pembayaran sukses! Menghapus pesan QR (ID: %s, chat: %s)...\n", qrMsgID, chatJID)
-					if delErr := w.DeleteMessage(context.Background(), chatJID, qrMsgID); delErr != nil {
-						fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
-					} else {
-						fmt.Printf("[WA-ImageMap] Pesan QR berhasil dihapus dari %s\n", chatJID)
-					}
-				} else {
-					fmt.Printf("[WA-ImageMap] Peringatan: QRMessageID tidak ditemukan untuk order %s, tidak ada pesan yang dihapus\n", order.PaymentID)
-				}
-
-				uploadDir := w.config.ImageMapUploadDir
-				if uploadDir == "" {
-					uploadDir = "upload/images"
-				}
-				_ = os.MkdirAll(uploadDir, 0755)
-
-				fileName := strings.ToLower(order.MapName) + ".png"
-				filePath := filepath.Join(uploadDir, fileName)
-
-				if err := os.WriteFile(filePath, order.ImageData, 0644); err != nil {
-					fmt.Printf("[WA-ImageMap] Gagal menyimpan file gambar %s: %v\n", filePath, err)
-				}
-
-				_ = w.imagemapManager.CompleteOrder(order.PaymentID, fileName)
-
-				// Kirim event WebSocket ke server Minecraft
-				publicURL := w.config.PublicURL
-				if publicURL == "" {
-					publicURL = fmt.Sprintf("http://192.168.18.67:%d", w.config.HTTPPort)
-				}
-				imageURL := fmt.Sprintf("%s/images/%s", strings.TrimSuffix(publicURL, "/"), fileName)
-
-				broadcasted := false
-				if w.broadcastCallback != nil {
-					broadcasted = w.broadcastCallback(map[string]interface{}{
-						"type":         "imagemap_paid",
-						"order_id":     order.PaymentID,
-						"map_name":     order.MapName,
-						"width":        order.Width,
-						"height":       order.Height,
-						"sender_phone": order.SenderPhone,
-						"image_path":   "/images/" + fileName,
-						"image_url":    imageURL,
-					})
-				}
-
-				if !broadcasted {
-					// Fallback jika belum tersambung ke WebSocket Minecraft plugin
-					w.imagemapManager.SetOrderWaitingUsername(order.PaymentID)
-					fallbackMsg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
-						"Rincian Pesanan:\n"+
-						"Nama Map    : %s\n"+
-						"Ukuran      : %dx%d (%d tile)\n"+
-						"Total Bayar : Rp %s\n"+
-						"Payment ID  : %s\n\n"+
-						"Gambar telah tersimpan di server. Silakan balas pesan ini dengan Username Minecraft Anda agar map dapat diklaim di dalam game.\n"+
-						"(Catatan: Untuk pemain Bedrock, wajib diawali tanda titik, contoh: *.NamaPlayer*)",
-						order.MapName, order.Width, order.Height, order.TotalTiles,
-						formatRupiah(order.Amount), order.PaymentID)
-					_ = w.SendToJID(context.Background(), chatJID, fallbackMsg)
-				}
-
-				// Beritahu juga grup log
-				logNotice := fmt.Sprintf("Pembayaran Terverifikasi\n\n"+
-					"Order ID    : %s\n"+
-					"Nama Map    : %s\n"+
-					"Pemesan     : %s\n"+
-					"Total       : Rp %s\n"+
-					"Lokasi File : %s\n"+
-					"Image URL   : %s",
-					order.PaymentID, order.MapName, order.SenderPhone,
-					formatRupiah(order.Amount), filePath, imageURL)
-				for _, target := range w.getModerationTargets() {
-					_ = w.SendToJID(context.Background(), target, logNotice)
-				}
+			status := strings.ToUpper(strings.TrimSpace(statusResp.Data.Status))
+			if status == "PAID" {
+				w.processImageMapPaymentSuccess(order)
 				return
-			} else if status == "cancel" || status == "expired" {
+			} else if status == "EXPIRED" || status == "FAILED" || status == "REFUND" {
 				// Hapus pesan QR jika dibatalkan atau kedaluwarsa
 				qrMsgID := order.QRMessageID
 				if qrMsgID == "" {
@@ -1366,15 +1721,15 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 					}
 				}
 				if qrMsgID != "" {
-					fmt.Printf("[WA-ImageMap] Status pembayaran %s, menghapus pesan QR (ID: %s, chat: %s)...\n", status, qrMsgID, chatJID)
+					fmt.Printf("[WA-ImageMap] Status pembayaran TriPay %s, menghapus pesan QR (ID: %s, chat: %s)...\n", status, qrMsgID, chatJID)
 					if delErr := w.DeleteMessage(context.Background(), chatJID, qrMsgID); delErr != nil {
 						fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
 					}
 				}
 
-				w.imagemapManager.CancelOrder(order.PaymentID, status)
+				w.imagemapManager.CancelOrder(order.PaymentID, strings.ToLower(status))
 				msg := fmt.Sprintf("Pembayaran Dibatalkan / Kedaluwarsa\n\n"+
-					"Pesanan imagemap '%s' (Payment ID: %s) tidak dapat dilanjutkan.", order.MapName, order.PaymentID)
+					"Pesanan imagemap '%s' (Payment ID: %s) tidak dapat dilanjutkan (Status: %s).", order.MapName, order.PaymentID, status)
 				_ = w.SendToJID(context.Background(), chatJID, msg)
 				return
 			}
@@ -1406,10 +1761,6 @@ func (w *WAClient) CancelUserPendingOrder(ctx context.Context, evt *events.Messa
 		if delErr := w.DeleteMessage(ctx, userChatJID, qrMsgID); delErr != nil {
 			fmt.Printf("[WA-ImageMap] Gagal menghapus pesan QR: %v\n", delErr)
 		}
-	}
-
-	if order.TransactionID != "" && w.casakuClient != nil {
-		_ = w.casakuClient.CancelPayment(ctx, order.TransactionID)
 	}
 
 	w.imagemapManager.CancelOrder(order.PaymentID, "cancelled_by_user")

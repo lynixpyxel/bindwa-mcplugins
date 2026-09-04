@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -238,5 +241,83 @@ func TestOTPExpiration(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusGone {
 		t.Fatalf("expected 410 Gone for expired OTP, got %d", rec.Code)
+	}
+}
+
+func TestTripayCallbackEndpoint(t *testing.T) {
+	privateKey := "test-private-key-123"
+	tripayClient := NewTripayClient("https://tripay.co.id/api-sandbox", "T1234", "test-api-key", privateKey, "QRIS")
+	imMgr := NewImageMapOrderManager("test_upload", "test_transactions.json")
+
+	// Daftarkan order pending
+	order := &ImageMapOrder{
+		PaymentID:     "MAP-WEBHOOK1",
+		TransactionID: "DEV-T123456789",
+		SenderPhone:   "628123456789",
+		ChatJID:       "628123456789@s.whatsapp.net",
+		MapName:       "testhook",
+		Amount:        5000,
+		Status:        "pending",
+	}
+	imMgr.RegisterAwaitingOrder(order)
+	_ = imMgr.ApproveOrder("MAP-WEBHOOK1", "DEV-T123456789", 5000)
+
+	waClient := &WAClient{
+		tripayClient:    tripayClient,
+		imagemapManager: imMgr,
+	}
+
+	cfg := Config{APIToken: "token123"}
+	server := NewServer(cfg, nil, waClient)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/tripay/callback", server.handleTripayCallback)
+
+	// 1. GET method -> 405 Method Not Allowed
+	req := httptest.NewRequest(http.MethodGet, "/api/tripay/callback", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 Method Not Allowed for GET, got %d", rec.Code)
+	}
+
+	// 2. POST with invalid signature -> 400 Bad Request
+	bodyJSON := `{"reference":"DEV-T123456789","merchant_ref":"MAP-WEBHOOK1","status":"PAID","total_amount":5000}`
+	req = httptest.NewRequest(http.MethodPost, "/api/tripay/callback", bytes.NewBufferString(bodyJSON))
+	req.Header.Set("X-Callback-Signature", "invalid_signature")
+	req.Header.Set("X-Callback-Event", "payment_status")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for invalid signature, got %d", rec.Code)
+	}
+
+	// 3. POST with valid signature & unhandled event -> 200 OK (unhandled event)
+	h := hmac.New(sha256.New, []byte(privateKey))
+	h.Write([]byte(bodyJSON))
+	validSig := hex.EncodeToString(h.Sum(nil))
+
+	req = httptest.NewRequest(http.MethodPost, "/api/tripay/callback", bytes.NewBufferString(bodyJSON))
+	req.Header.Set("X-Callback-Signature", validSig)
+	req.Header.Set("X-Callback-Event", "other_event")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for unhandled event, got %d", rec.Code)
+	}
+
+	// 4. POST with valid signature & payment_status = PAID -> 200 OK and order completed
+	req = httptest.NewRequest(http.MethodPost, "/api/tripay/callback", bytes.NewBufferString(bodyJSON))
+	req.Header.Set("X-Callback-Signature", validSig)
+	req.Header.Set("X-Callback-Event", "payment_status")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for valid PAID callback, got %d", rec.Code)
+	}
+
+	completed := imMgr.GetOrderByPaymentID("MAP-WEBHOOK1")
+	if completed == nil || (completed.Status != "paid" && completed.Status != "waiting_mc_username") {
+		t.Errorf("expected order to be paid or waiting_mc_username after webhook callback, got %+v", completed)
 	}
 }

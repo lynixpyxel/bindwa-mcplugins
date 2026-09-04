@@ -2,10 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"image"
 	"image/color"
+	"image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -152,30 +160,37 @@ func TestParseImageMapArgs(t *testing.T) {
 
 func TestCalculateImageMapPrice(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.ImageMapPricing = map[string]int{
-		"1x1": 1000,
-		"3x3": 2500,
-	}
-	cfg.ImageMapPricePerTile = 1000
 
-	// 1x1 tiered
-	if p := cfg.CalculateImageMapPrice(1, 1); p != 1000 {
-		t.Errorf("expected 1x1 price 1000, got %d", p)
+	// Static image: default flat 5000 regardless of dimension
+	if p := cfg.CalculateImageMapPrice(1, 1, false); p != 5000 {
+		t.Errorf("expected 1x1 image price 5000, got %d", p)
 	}
-
-	// 3x3 tiered
-	if p := cfg.CalculateImageMapPrice(3, 3); p != 2500 {
-		t.Errorf("expected 3x3 price 2500, got %d", p)
+	if p := cfg.CalculateImageMapPrice(2, 2, false); p != 5000 {
+		t.Errorf("expected 2x2 image price 5000, got %d", p)
+	}
+	if p := cfg.CalculateImageMapPrice(3, 3, false); p != 5000 {
+		t.Errorf("expected 3x3 image price 5000, got %d", p)
 	}
 
-	// 2x2 fallback: 4 * 1000 = 4000
-	if p := cfg.CalculateImageMapPrice(2, 2); p != 4000 {
-		t.Errorf("expected 2x2 price 4000, got %d", p)
+	// GIF animation: default flat 7000 regardless of dimension
+	if p := cfg.CalculateImageMapPrice(1, 1, true); p != 7000 {
+		t.Errorf("expected 1x1 gif price 7000, got %d", p)
+	}
+	if p := cfg.CalculateImageMapPrice(2, 2, true); p != 7000 {
+		t.Errorf("expected 2x2 gif price 7000, got %d", p)
+	}
+	if p := cfg.CalculateImageMapPrice(4, 4, true); p != 7000 {
+		t.Errorf("expected 4x4 gif price 7000, got %d", p)
 	}
 
-	// 1x2 fallback: 2 * 1000 = 2000
-	if p := cfg.CalculateImageMapPrice(1, 2); p != 2000 {
-		t.Errorf("expected 1x2 price 2000, got %d", p)
+	// Custom configuration
+	cfg.ImageMapPriceImage = 6000
+	cfg.ImageMapPriceGIF = 9000
+	if p := cfg.CalculateImageMapPrice(2, 2, false); p != 6000 {
+		t.Errorf("expected custom image price 6000, got %d", p)
+	}
+	if p := cfg.CalculateImageMapPrice(2, 2, true); p != 9000 {
+		t.Errorf("expected custom gif price 9000, got %d", p)
 	}
 }
 
@@ -245,12 +260,16 @@ func TestImageMapOrderManager(t *testing.T) {
 	}
 
 	// Test ApproveOrder
-	cancelCh := mgr.ApproveOrder("MAP-1234", "trx-casaku-123", 4000)
+	cancelCh := mgr.ApproveOrder("MAP-1234", "DEV-T0001000000000000001", 4000)
 	if cancelCh == nil {
 		t.Fatalf("expected valid cancelCh from ApproveOrder")
 	}
 	if fetched.Status != "pending" {
 		t.Errorf("expected status to be pending after approval, got %s", fetched.Status)
+	}
+	byTrx := mgr.GetOrderByTransactionID("dev-t0001000000000000001")
+	if byTrx == nil || byTrx.PaymentID != "MAP-1234" {
+		t.Fatalf("expected GetOrderByTransactionID to find order case-insensitively")
 	}
 
 	// Test CompleteOrder
@@ -317,6 +336,37 @@ func TestValidateAndConvertToPNG(t *testing.T) {
 	bounds := decodedImg.Bounds()
 	if bounds.Dx() != 100 || bounds.Dy() != 100 {
 		t.Errorf("expected 100x100, got %dx%d", bounds.Dx(), bounds.Dy())
+	}
+}
+
+func TestValidateGIF(t *testing.T) {
+	// Create synthetic GIF
+	pal := color.Palette{color.White, color.Black}
+	gifImg := image.NewPaletted(image.Rect(0, 0, 10, 10), pal)
+	var buf bytes.Buffer
+	g := &gif.GIF{
+		Image: []*image.Paletted{gifImg},
+		Delay: []int{10},
+	}
+	if err := gif.EncodeAll(&buf, g); err != nil {
+		t.Fatalf("failed to encode gif: %v", err)
+	}
+
+	gifBytes := buf.Bytes()
+	if !isGIFBytes(gifBytes) {
+		t.Errorf("expected isGIFBytes to be true for valid gif")
+	}
+
+	if err := ValidateGIF(gifBytes); err != nil {
+		t.Errorf("expected ValidateGIF to pass, got: %v", err)
+	}
+
+	// Test invalid bytes
+	if isGIFBytes([]byte("not a gif")) {
+		t.Errorf("expected isGIFBytes to be false for non-gif")
+	}
+	if err := ValidateGIF([]byte("not a gif")); err == nil {
+		t.Errorf("expected ValidateGIF to fail for invalid gif")
 	}
 }
 
@@ -491,6 +541,129 @@ func TestExtractOrderIDFromQuotedButtons(t *testing.T) {
 	extracted = w.extractOrderIDFromEvent(evtWithImageQuote)
 	if extracted != "MAP-9ABC" {
 		t.Errorf("expected MAP-9ABC extracted from quoted image message caption, got %s", extracted)
+	}
+}
+
+func TestTripaySignature(t *testing.T) {
+	client := NewTripayClient("https://tripay.co.id/api-sandbox", "T1234", "api-key-xyz", "secret-private-key", "QRIS")
+	sig := client.GenerateSignature("MAP-TEST-REF", 5000)
+
+	// Signature harus 64 karakter hex (SHA256)
+	if len(sig) != 64 {
+		t.Fatalf("expected 64 hex characters signature, got %d chars: %s", len(sig), sig)
+	}
+
+	// Signature harus konsisten dan reproducible
+	sig2 := client.GenerateSignature("MAP-TEST-REF", 5000)
+	if sig != sig2 {
+		t.Errorf("signature should be deterministic: %s != %s", sig, sig2)
+	}
+
+	// Beda amount atau ref harus menghasilkan signature berbeda
+	sigDiff := client.GenerateSignature("MAP-TEST-REF", 7000)
+	if sig == sigDiff {
+		t.Errorf("different amount should produce different signature")
+	}
+}
+
+func TestTripayValidateCallbackSignature(t *testing.T) {
+	secretKey := "my-secret-key"
+	client := NewTripayClient("https://tripay.co.id/api-sandbox", "T1234", "api-key-xyz", secretKey, "QRIS")
+	body := []byte(`{"reference":"DEV-123","merchant_ref":"MAP-001","status":"PAID"}`)
+
+	// Hitung HMAC-SHA256 yang valid dari raw body
+	h := hmac.New(sha256.New, []byte(secretKey))
+	h.Write(body)
+	validSig := hex.EncodeToString(h.Sum(nil))
+
+	if !client.ValidateCallbackSignature(body, validSig) {
+		t.Errorf("expected valid signature to pass validation")
+	}
+
+	if client.ValidateCallbackSignature(body, "invalid_signature_hex") {
+		t.Errorf("expected invalid signature to fail validation")
+	}
+
+	tamperedBody := []byte(`{"reference":"DEV-123","merchant_ref":"MAP-001","status":"FAILED"}`)
+	if client.ValidateCallbackSignature(tamperedBody, validSig) {
+		t.Errorf("expected tampered body to fail validation with original signature")
+	}
+}
+
+func TestTripayClientAPI(t *testing.T) {
+	// Mock HTTP Server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/transaction/create":
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer test-api-key" {
+				t.Errorf("expected Bearer test-api-key, got %s", auth)
+			}
+
+			resp := TripayCreateResponse{
+				Success: true,
+				Data: TripayTransactionData{
+					Reference:   "DEV-T0001000000000000006",
+					MerchantRef: "MAP-ORDER1",
+					Amount:      5000,
+					Status:      "UNPAID",
+					QRString:    "00020101021226590014ID.LINKAJA.WWW01189360000201100000005204581253033605802ID5911Toko Dummy6007BANDUNG61054011562070703A01630467A3",
+					ExpiredTime: time.Now().Add(15 * time.Minute).Unix(),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+
+		case "/transaction/detail":
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			ref := r.URL.Query().Get("reference")
+			if ref != "DEV-T0001000000000000006" {
+				t.Errorf("expected reference DEV-T0001000000000000006, got %s", ref)
+			}
+
+			resp := TripayDetailResponse{
+				Success: true,
+				Data: TripayTransactionData{
+					Reference:   ref,
+					MerchantRef: "MAP-ORDER1",
+					Amount:      5000,
+					Status:      "PAID",
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewTripayClient(server.URL, "T9999", "test-api-key", "test-private-key", "QRIS")
+
+	// 1. Test CreateClosedTransaction
+	ctx := context.Background()
+	createResp, err := client.CreateClosedTransaction(ctx, "MAP-ORDER1", "logo", 5000, "628123456789")
+	if err != nil {
+		t.Fatalf("CreateClosedTransaction failed: %v", err)
+	}
+	if !createResp.Success || createResp.Data.Reference != "DEV-T0001000000000000006" {
+		t.Errorf("unexpected create response: %+v", createResp)
+	}
+	if createResp.Data.QRString == "" {
+		t.Errorf("expected qr_string to be populated")
+	}
+
+	// 2. Test CheckTransactionStatus
+	detailResp, err := client.CheckTransactionStatus(ctx, "DEV-T0001000000000000006")
+	if err != nil {
+		t.Fatalf("CheckTransactionStatus failed: %v", err)
+	}
+	if !detailResp.Success || detailResp.Data.Status != "PAID" {
+		t.Errorf("unexpected detail response: %+v", detailResp)
 	}
 }
 

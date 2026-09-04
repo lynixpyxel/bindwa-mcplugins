@@ -15,5 +15,17 @@
   "owner_number": "6285294959195",
   "otp_ttl_seconds": 300,
   "otp_cooldown_seconds": 60,
-  "otp_max_attempts": 5
+  "otp_max_attempts": 5,
+  "merchant_code": "TRIPAY_MERCHANT_CODE",
+  "api_key": "TRIPAY_API_KEY",
+  "private_key": "TRIPAY_PRIVATE_KEY",
+  "mode": "sandbox",
+  "tripay": {
+    "merchant_code": "TRIPAY_MERCHANT_CODE",
+    "api_key": "TRIPAY_API_KEY",
+    "private_key": "TRIPAY_PRIVATE_KEY",
+    "mode": "sandbox"
+  },
+  "imagemap_price_image": 5000,
+  "imagemap_price_gif": 7000
 }

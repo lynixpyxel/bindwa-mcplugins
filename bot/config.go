@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -18,13 +19,32 @@ type Config struct {
 	OTPTTLSeconds        int            `json:"otp_ttl_seconds"`
 	OTPCooldownSeconds   int            `json:"otp_cooldown_seconds"`
 	OTPMaxAttempts       int            `json:"otp_max_attempts"`
-	CasakuLicenseKey     string         `json:"casaku_license_key"`
-	CasakuQRID           string         `json:"casaku_qr_id"`
-	CasakuBaseURL        string         `json:"casaku_base_url"`
-	ImageMapPricing      map[string]int `json:"imagemap_pricing"`
-	ImageMapPricePerTile int            `json:"imagemap_price_per_tile"`
+	CasakuLicenseKey     string         `json:"casaku_license_key,omitempty"`
+	CasakuQRID           string         `json:"casaku_qr_id,omitempty"`
+	CasakuBaseURL        string         `json:"casaku_base_url,omitempty"`
+	TripayMerchantCode   string         `json:"tripay_merchant_code,omitempty"`
+	TripayAPIKey         string         `json:"tripay_api_key,omitempty"`
+	TripayPrivateKey     string         `json:"tripay_private_key,omitempty"`
+	TripayMode           string         `json:"tripay_mode,omitempty"`
+	MerchantCode         string         `json:"merchant_code,omitempty"`
+	APIKey               string         `json:"api_key,omitempty"`
+	PrivateKey           string         `json:"private_key,omitempty"`
+	Mode                 string         `json:"mode,omitempty"`
+	Tripay               TripayConfig   `json:"tripay"`
+	ImageMapPricing      map[string]int `json:"imagemap_pricing,omitempty"`
+	ImageMapPricePerTile int            `json:"imagemap_price_per_tile,omitempty"`
+	ImageMapPriceImage   int            `json:"imagemap_price_image"`
+	ImageMapPriceGIF     int            `json:"imagemap_price_gif"`
 	ImageMapUploadDir    string         `json:"imagemap_upload_dir"`
 	PublicURL            string         `json:"public_url,omitempty"`
+}
+
+type TripayConfig struct {
+	MerchantCode  string `json:"merchant_code"`
+	APIKey        string `json:"api_key"`
+	PrivateKey    string `json:"private_key"`
+	Mode          string `json:"mode"` // "sandbox" or "production"
+	PaymentMethod string `json:"payment_method,omitempty"` // default "QRIS"
 }
 
 func DefaultConfig() Config {
@@ -43,30 +63,73 @@ func DefaultConfig() Config {
 		CasakuLicenseKey:   "cashify_a236950d9c2edcc2db4d18d7f593320e6d37fa2ebd6a85959b5cd488a0913ef0",
 		CasakuQRID:         "8f416161-b590-407a-aefc-17b4d2fb3666",
 		CasakuBaseURL:      "https://api.casaku.id",
-		ImageMapPricing: map[string]int{
-			"1x1": 1000,
-			"3x3": 2500,
+		Tripay: TripayConfig{
+			MerchantCode:  "TRIPAY_MERCHANT_CODE",
+			APIKey:        "TRIPAY_API_KEY",
+			PrivateKey:    "TRIPAY_PRIVATE_KEY",
+			Mode:          "sandbox",
+			PaymentMethod: "QRIS",
 		},
-		ImageMapPricePerTile: 1000,
-		ImageMapUploadDir:    "upload/images",
+		ImageMapPriceImage: 5000,
+		ImageMapPriceGIF:   7000,
+		ImageMapUploadDir:  "upload/images",
 	}
 }
 
-func (cfg *Config) CalculateImageMapPrice(width, height int) int {
-	key := fmt.Sprintf("%dx%d", width, height)
-	if p, ok := cfg.ImageMapPricing[key]; ok && p > 0 {
-		return p
+func (cfg *Config) GetTripayConfig() TripayConfig {
+	t := cfg.Tripay
+	if cfg.TripayMerchantCode != "" {
+		t.MerchantCode = cfg.TripayMerchantCode
 	}
-	revKey := fmt.Sprintf("%dx%d", height, width)
-	if p, ok := cfg.ImageMapPricing[revKey]; ok && p > 0 {
-		return p
+	if cfg.MerchantCode != "" {
+		t.MerchantCode = cfg.MerchantCode
 	}
-	tiles := width * height
-	rate := cfg.ImageMapPricePerTile
-	if rate <= 0 {
-		rate = 1000
+	if cfg.TripayAPIKey != "" {
+		t.APIKey = cfg.TripayAPIKey
 	}
-	return tiles * rate
+	if cfg.APIKey != "" {
+		t.APIKey = cfg.APIKey
+	}
+	if cfg.TripayPrivateKey != "" {
+		t.PrivateKey = cfg.TripayPrivateKey
+	}
+	if cfg.PrivateKey != "" {
+		t.PrivateKey = cfg.PrivateKey
+	}
+	if cfg.TripayMode != "" {
+		t.Mode = cfg.TripayMode
+	}
+	if cfg.Mode != "" {
+		t.Mode = cfg.Mode
+	}
+	if t.Mode == "" {
+		t.Mode = "sandbox"
+	}
+	if t.PaymentMethod == "" {
+		t.PaymentMethod = "QRIS"
+	}
+	return t
+}
+
+func (t TripayConfig) GetBaseURL() string {
+	mode := strings.ToLower(strings.TrimSpace(t.Mode))
+	if mode == "production" || mode == "live" {
+		return "https://tripay.co.id/api"
+	}
+	return "https://tripay.co.id/api-sandbox"
+}
+
+func (cfg *Config) CalculateImageMapPrice(width, height int, isGIF bool) int {
+	if isGIF {
+		if cfg.ImageMapPriceGIF > 0 {
+			return cfg.ImageMapPriceGIF
+		}
+		return 7000
+	}
+	if cfg.ImageMapPriceImage > 0 {
+		return cfg.ImageMapPriceImage
+	}
+	return 5000
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -124,17 +187,26 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.CasakuBaseURL == "" {
 		cfg.CasakuBaseURL = "https://api.casaku.id"
 	}
+	if envMerch := os.Getenv("TRIPAY_MERCHANT_CODE"); envMerch != "" {
+		cfg.Tripay.MerchantCode = envMerch
+	}
+	if envAPI := os.Getenv("TRIPAY_API_KEY"); envAPI != "" {
+		cfg.Tripay.APIKey = envAPI
+	}
+	if envPriv := os.Getenv("TRIPAY_PRIVATE_KEY"); envPriv != "" {
+		cfg.Tripay.PrivateKey = envPriv
+	}
+	if envMode := os.Getenv("TRIPAY_MODE"); envMode != "" {
+		cfg.Tripay.Mode = envMode
+	}
 	if cfg.ImageMapUploadDir == "" {
 		cfg.ImageMapUploadDir = "upload/images"
 	}
-	if cfg.ImageMapPricePerTile <= 0 {
-		cfg.ImageMapPricePerTile = 1000
+	if cfg.ImageMapPriceImage <= 0 {
+		cfg.ImageMapPriceImage = 5000
 	}
-	if cfg.ImageMapPricing == nil {
-		cfg.ImageMapPricing = map[string]int{
-			"1x1": 1000,
-			"3x3": 2500,
-		}
+	if cfg.ImageMapPriceGIF <= 0 {
+		cfg.ImageMapPriceGIF = 7000
 	}
 
 	return cfg, nil

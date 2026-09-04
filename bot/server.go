@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -527,6 +528,62 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleTripayCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"success": false, "message": "method not allowed"})
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "cannot read body"})
+		return
+	}
+
+	sig := r.Header.Get("X-Callback-Signature")
+	event := r.Header.Get("X-Callback-Event")
+
+	if s.waClient == nil || s.waClient.GetTripayClient() == nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": "tripay client not available"})
+		return
+	}
+
+	tripayClient := s.waClient.GetTripayClient()
+	if !tripayClient.ValidateCallbackSignature(body, sig) {
+		fmt.Printf("[TriPay-Callback] Signature tidak valid (sig: %s)\n", sig)
+		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "invalid signature"})
+		return
+	}
+
+	if event != "payment_status" {
+		fmt.Printf("[TriPay-Callback] Event '%s' diabaikan\n", event)
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "unhandled event"})
+		return
+	}
+
+	var data struct {
+		Reference   string `json:"reference"`
+		MerchantRef string `json:"merchant_ref"`
+		Status      string `json:"status"`
+		TotalAmount int    `json:"total_amount"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "invalid json payload"})
+		return
+	}
+
+	status := strings.ToUpper(strings.TrimSpace(data.Status))
+	fmt.Printf("[TriPay-Callback] Menerima status '%s' untuk merchant_ref=%s, reference=%s\n", status, data.MerchantRef, data.Reference)
+
+	if status == "PAID" {
+		if err := s.waClient.HandleTripayPaymentCallback(data.MerchantRef, data.Reference); err != nil {
+			fmt.Printf("[TriPay-Callback] Gagal memproses callback: %v\n", err)
+		}
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/send-otp", s.authMiddleware(s.handleSendOTP))
@@ -536,6 +593,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/server-status", s.authMiddleware(s.handleServerStatus))
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/tripay/callback", s.handleTripayCallback)
+	mux.HandleFunc("/tripay/callback", s.handleTripayCallback)
 
 	// Static file server untuk melayani gambar ImageMap ke server Minecraft
 	uploadDir := s.cfg.ImageMapUploadDir

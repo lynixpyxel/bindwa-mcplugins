@@ -80,7 +80,7 @@ type WAClient struct {
 	latestLeaderboard []LeaderboardEntry
 	leaderboardMu     sync.RWMutex
 	imagemapManager   *ImageMapOrderManager
-	casakuClient      *CasakuClient
+	tripayClient      *TripayClient
 }
 
 func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath string) (*WAClient, error) {
@@ -103,7 +103,8 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath stri
 		uploadDir = "upload/images"
 	}
 	imManager := NewImageMapOrderManager(uploadDir, "upload/imagemap_transactions.json")
-	casaku := NewCasakuClient(cfg.CasakuBaseURL, cfg.CasakuLicenseKey, cfg.CasakuQRID)
+	tripayCfg := cfg.GetTripayConfig()
+	tripay := NewTripayClient(tripayCfg.GetBaseURL(), tripayCfg.MerchantCode, tripayCfg.APIKey, tripayCfg.PrivateKey, tripayCfg.PaymentMethod)
 
 	w := &WAClient{
 		client:          client,
@@ -116,7 +117,7 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath stri
 		welcomeManager:  NewWelcomeManager("group_welcome.json"),
 		participantMap:  make(map[string]string),
 		imagemapManager: imManager,
-		casakuClient:    casaku,
+		tripayClient:    tripay,
 	}
 
 	client.AddEventHandler(w.eventHandler)
@@ -1704,15 +1705,16 @@ func (w *WAClient) replyMenu(chatJID types.JID, evt *events.Message) {
 		"• *.top* / *.elytratop* : Leaderboard perolehan elytra\n"+
 		"• *.chat <pesan>* : Kirim chat ke dalam game Minecraft\n"+
 		"• *.mccmdlist* : Daftar perintah command in-game Minecraft\n\n"+
-		"🖼️ *IMAGE MAP (CUSTOM PICTURE)*\n"+
+		"🖼️ *IMAGE MAP (CUSTOM PICTURE / GIF)*\n"+
+		"  _Tarif: Gambar Rp 5.000 | GIF Rp 7.000 (Flat)_\n"+
 		"• *.imagemap <nama> <tinggi> <lebar>*\n"+
-		"  _Beli custom map dengan reply atau caption foto._\n"+
+		"  _Beli custom map dengan reply atau caption foto/GIF._\n"+
 		"  Contoh: `.imagemap logo 2 2`\n"+
 		"• *.imagemap <nama> <lebar>x<tinggi>*\n"+
 		"  _Format cross lebih ringkas._\n"+
 		"  Contoh: `.imagemap logo 2x2`\n"+
 		"• *.imagemap <url> <nama> <lebar>x<tinggi>*\n"+
-		"  _Pesan map langsung menggunakan URL link gambar._\n"+
+		"  _Pesan map langsung menggunakan URL link gambar/GIF._\n"+
 		"• *.cancelmap* : Batalkan order imagemap yang aktif\n"+
 		"• *.acc <order_id>* : Setujui pesanan imagemap (Admin)\n"+
 		"• *.decline <order_id> [alasan]* : Tolak pesanan imagemap (Admin)\n\n"+
@@ -1961,7 +1963,11 @@ func (w *WAClient) HandleAssignImageMapUsername(ctx context.Context, evt *events
 		}
 		fileName := order.SavedFileName
 		if fileName == "" {
-			fileName = strings.ToLower(order.MapName) + ".png"
+			ext := ".png"
+			if order.MediaType == "gif" {
+				ext = ".gif"
+			}
+			fileName = strings.ToLower(order.MapName) + ext
 		}
 		imageURL := fmt.Sprintf("%s/images/%s", strings.TrimSuffix(publicURL, "/"), fileName)
 
