@@ -1606,7 +1606,7 @@ func (w *WAClient) processImageMapPaymentSuccess(order *ImageMapOrder) bool {
 			"Ukuran      : %dx%d (%d tile)\n"+
 			"Total Bayar : Rp %s\n"+
 			"Payment ID  : %s\n\n"+
-			"Media telah tersimpan di server. Silakan balas pesan ini dengan Username Minecraft Anda agar map dapat diklaim di dalam game.\n"+
+			"Media telah tersimpan di server. Silakan balas (reply) pesan ini dengan *Username Minecraft* Anda (atau ketik *.setuser <username>*) agar map dapat diklaim di dalam game.\n"+
 			"(Catatan: Untuk pemain Bedrock, wajib diawali tanda titik, contoh: *.NamaPlayer*)",
 			current.MapName, typeLabel, current.Width, current.Height, current.TotalTiles,
 			formatRupiah(current.Amount), current.PaymentID)

@@ -557,10 +557,13 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 	if !isCmd {
 		// Cek apakah user sedang ditunggu input Minecraft username untuk order imagemap
+		// PENTING: Hanya tanggapi jika user me-reply (mengutip) pesan prompt bot, bukan saat ngechat biasa
 		senderPhone := w.resolveSenderPhone(evt)
 		if order := w.imagemapManager.GetOrderWaitingUsername(senderPhone); order != nil {
-			go w.HandleAssignImageMapUsername(context.Background(), evt, order, text)
-			return
+			if w.isReplyingToUsernamePrompt(evt, order) {
+				go w.HandleAssignImageMapUsername(context.Background(), evt, order, text)
+				return
+			}
 		}
 
 		// Jika pesan bukan command, cek apakah me-reply pesan dari bot di grup yang terhubung
@@ -1084,6 +1087,67 @@ func (w *WAClient) isReplyingToBot(evt *events.Message) bool {
 			strings.HasPrefix(qText, "*PERATURAN") {
 			return true
 		}
+	}
+
+	return false
+}
+
+// isReplyingToUsernamePrompt memeriksa apakah pesan me-reply (mengutip) pesan prompt permintaan username dari bot.
+func (w *WAClient) isReplyingToUsernamePrompt(evt *events.Message, order *ImageMapOrder) bool {
+	if evt == nil || evt.Message == nil {
+		return false
+	}
+
+	ctxInfo := w.extractContextInfo(evt.Message)
+	if ctxInfo == nil || ctxInfo.GetStanzaID() == "" {
+		// Pesan biasa tanpa me-reply apapun
+		return false
+	}
+
+	// 1. Cek isi teks dari pesan yang di-quote
+	qm := ctxInfo.GetQuotedMessage()
+	if qm != nil {
+		qText := w.extractTextFromMessage(qm)
+		if qText != "" {
+			if strings.Contains(qText, "Username Minecraft") ||
+				strings.Contains(qText, "balas pesan ini") ||
+				strings.Contains(qText, "balas (reply) pesan ini") ||
+				strings.Contains(qText, "/getimagemap") ||
+				(order != nil && order.PaymentID != "" && strings.Contains(qText, order.PaymentID)) {
+				return true
+			}
+		}
+	}
+
+	// 2. Cek apakah me-reply pesan dari bot
+	isFromBot := false
+	if w.client != nil && w.client.Store != nil && w.client.Store.ID != nil {
+		botUser := w.client.Store.ID.User
+		if botUser != "" && strings.Contains(ctxInfo.GetParticipant(), botUser) {
+			isFromBot = true
+		}
+	}
+
+	// Di private chat dengan bot (DM), jika participant kosong atau sama dengan bot
+	if !evt.Info.IsGroup && (ctxInfo.GetParticipant() == "" || isFromBot) {
+		isFromBot = true
+	}
+
+	if isFromBot {
+		// Pastikan pesan yang di-quote bukan broadcast game atau chat Minecraft
+		if qm != nil {
+			qText := w.extractTextFromMessage(qm)
+			if strings.HasPrefix(qText, "*|Server|*") ||
+				strings.HasPrefix(qText, "*Ender Dragon*") ||
+				strings.HasPrefix(qText, "*Dragon Egg*") ||
+				strings.HasPrefix(qText, "⚡ *") ||
+				strings.HasPrefix(qText, "*Leaderboard") ||
+				strings.HasPrefix(qText, "👋 *SELAMAT") ||
+				strings.HasPrefix(qText, "*PERATURAN") {
+				return false
+			}
+		}
+		return true
 	}
 
 	return false
@@ -1927,7 +1991,7 @@ func (w *WAClient) HandleImageMapOrderStatusFromMC(orderID string, bound bool, p
 		msg := fmt.Sprintf("Pembayaran Berhasil\n\n"+
 			"Gambar imagemap '%s' (Order ID: %s) telah diproses ke server Minecraft.\n"+
 			"Nomor WhatsApp Anda belum terhubung dengan akun Minecraft manapun.\n\n"+
-			"Silakan balas pesan ini dengan *Username Minecraft* Anda agar map dapat diklaim di dalam game.\n"+
+			"Silakan balas (reply) pesan ini dengan *Username Minecraft* Anda (atau ketik *.setuser <username>*) agar map dapat diklaim di dalam game.\n"+
 			"(Catatan: Untuk pemain Bedrock, wajib diawali tanda titik, contoh: *.NamaPlayer*)",
 			order.MapName, order.PaymentID)
 		_ = w.SendToJID(context.Background(), chatJID, msg)
@@ -1937,18 +2001,24 @@ func (w *WAClient) HandleImageMapOrderStatusFromMC(orderID string, bound bool, p
 // HandleAssignImageMapUsername memproses input username Minecraft dari pemesan yang belum ter-bind.
 func (w *WAClient) HandleAssignImageMapUsername(ctx context.Context, evt *events.Message, order *ImageMapOrder, usernameInput string) {
 	username := strings.TrimSpace(usernameInput)
-	// Bersihkan prefix jika dikirim via .setuser
-	for _, p := range []string{".setuser", "!setuser", "/setuser", "setuser"} {
+	// Bersihkan prefix jika dikirim via command (.setuser, .setmc, .claimuser)
+	for _, p := range []string{".setuser", "!setuser", "/setuser", "setuser", ".setmc", "!setmc", "/setmc", "setmc", ".claimuser", "!claimuser", "/claimuser", "claimuser"} {
 		if strings.HasPrefix(strings.ToLower(username), p) {
 			username = strings.TrimSpace(username[len(p):])
 			break
 		}
 	}
 
+	chatJID := evt.Info.Chat
+
+	if username == "" {
+		_ = w.SendReplyToGroup(ctx, chatJID, "Silakan masukkan username Minecraft Anda.\nContoh: .setuser Steve atau balas (reply) pesan bot dengan username Anda.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+		return
+	}
+
 	// Validasi username Minecraft (Java: 2-16 char alfanumerik+underscore; Bedrock: diawali titik lalu 1-16 char)
 	matched, _ := regexp.MatchString(`^\.?[a-zA-Z0-9_]{2,16}$`, username)
 	if !matched {
-		chatJID := evt.Info.Chat
 		_ = w.SendReplyToGroup(ctx, chatJID, "Username Minecraft tidak valid. Panjang harus 2-16 karakter (huruf, angka, garis bawah). Untuk pemain Bedrock diawali tanda titik (contoh: .PlayerBedrock).", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
@@ -1983,7 +2053,6 @@ func (w *WAClient) HandleAssignImageMapUsername(ctx context.Context, evt *events
 		})
 	}
 
-	chatJID := evt.Info.Chat
 	confirmMsg := fmt.Sprintf("Akun Minecraft *%s* berhasil dihubungkan ke imagemap '%s' (Order ID: %s)!\n\n"+
 		"Silakan masuk ke server Minecraft dan ketik */getimagemap* untuk mengambil item map ke inventory Anda.",
 		username, order.MapName, order.PaymentID)

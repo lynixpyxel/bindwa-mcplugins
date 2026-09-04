@@ -22,6 +22,7 @@ import (
 
 	"github.com/skip2/go-qrcode"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
@@ -664,6 +665,96 @@ func TestTripayClientAPI(t *testing.T) {
 	}
 	if !detailResp.Success || detailResp.Data.Status != "PAID" {
 		t.Errorf("unexpected detail response: %+v", detailResp)
+	}
+}
+
+func TestIsReplyingToUsernamePrompt(t *testing.T) {
+	w := &WAClient{}
+	order := &ImageMapOrder{
+		PaymentID: "MAP-TEST1",
+		Status:    "waiting_mc_username",
+	}
+
+	// 1. Pesan biasa tanpa reply (ContextInfo nil) -> HARUS FALSE
+	evtPlain := &events.Message{
+		Message: &waProto.Message{
+			Conversation: proto.String("halo semua lagi ngapain"),
+		},
+	}
+	if w.isReplyingToUsernamePrompt(evtPlain, order) {
+		t.Errorf("expected false for plain chat without reply, got true")
+	}
+
+	// 2. Pesan me-reply chat orang lain di grup (bukan bot prompt) -> HARUS FALSE
+	evtReplyFriend := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				IsGroup: true,
+			},
+		},
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("iya nanti kita main bareng"),
+				ContextInfo: &waProto.ContextInfo{
+					StanzaID:    proto.String("msg-friend-123"),
+					Participant: proto.String("628111111111@s.whatsapp.net"),
+					QuotedMessage: &waProto.Message{
+						Conversation: proto.String("mabar nanti malam yuk"),
+					},
+				},
+			},
+		},
+	}
+	if w.isReplyingToUsernamePrompt(evtReplyFriend, order) {
+		t.Errorf("expected false for replying to another user's chat, got true")
+	}
+
+	// 3. Pesan me-reply chat server minecraft (*|Server|* player: halo) -> HARUS FALSE
+	evtReplyServer := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				IsGroup: true,
+			},
+		},
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("halo juga"),
+				ContextInfo: &waProto.ContextInfo{
+					StanzaID:    proto.String("msg-server-123"),
+					Participant: proto.String("628999999999@s.whatsapp.net"),
+					QuotedMessage: &waProto.Message{
+						Conversation: proto.String("*|Server|* [VIP] Player1: halo semua"),
+					},
+				},
+			},
+		},
+	}
+	if w.isReplyingToUsernamePrompt(evtReplyServer, order) {
+		t.Errorf("expected false for replying to Minecraft game chat, got true")
+	}
+
+	// 4. Pesan me-reply prompt bot yang meminta Username Minecraft -> HARUS TRUE
+	evtReplyPrompt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				IsGroup: true,
+			},
+		},
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("Steve_Pro"),
+				ContextInfo: &waProto.ContextInfo{
+					StanzaID:    proto.String("msg-prompt-123"),
+					Participant: proto.String("628999999999@s.whatsapp.net"),
+					QuotedMessage: &waProto.Message{
+						Conversation: proto.String("Pembayaran Berhasil\n\nOrder ID: MAP-TEST1\nSilakan balas pesan ini dengan *Username Minecraft* Anda agar map dapat diklaim di dalam game."),
+					},
+				},
+			},
+		},
+	}
+	if !w.isReplyingToUsernamePrompt(evtReplyPrompt, order) {
+		t.Errorf("expected true when replying to username prompt, got false")
 	}
 }
 
