@@ -57,6 +57,7 @@ type WABroadcastCallback func(payload interface{}) bool
 
 type cachedGroup struct {
 	name      string
+	info      *types.GroupInfo
 	updatedAt time.Time
 }
 
@@ -155,40 +156,65 @@ func (w *WAClient) GetServerStatus() ServerStatus {
 	return status
 }
 
-func (w *WAClient) GetGroupName(jid types.JID) string {
-	jidStr := jid.String()
+func (w *WAClient) GetGroupInfoCached(ctx context.Context, groupJID types.JID) *types.GroupInfo {
+	if groupJID.IsEmpty() || groupJID.Server != types.GroupServer {
+		return nil
+	}
+
+	jidStr := groupJID.String()
 
 	w.groupMu.RLock()
 	cached, exists := w.groupNames[jidStr]
 	w.groupMu.RUnlock()
 
-	// Jika cache masih segar (< 1 menit), gunakan langsung
-	if exists && cached.name != "" && time.Since(cached.updatedAt) < 1*time.Minute {
-		return cached.name
+	// Jika cache masih segar (< 3 menit), gunakan langsung
+	if exists && cached.info != nil && time.Since(cached.updatedAt) < 3*time.Minute {
+		return cached.info
 	}
 
-	if !w.IsReady() {
-		if exists && cached.name != "" {
-			return cached.name
+	if w.client == nil || !w.IsReady() {
+		if exists && cached.info != nil {
+			return cached.info
 		}
-		return "Grup WA"
+		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	fetchCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
 	defer cancel()
 
-	info, err := w.client.GetGroupInfo(ctx, jid)
-	if err == nil && info != nil && info.Name != "" {
+	info, err := w.client.GetGroupInfo(fetchCtx, groupJID)
+	if err != nil {
+		fmt.Printf("[WA-Group] GetGroupInfo gagal untuk %s: %v\n", jidStr, err)
+		if exists && cached.info != nil {
+			return cached.info
+		}
+		return nil
+	}
+
+	if info != nil {
 		w.groupMu.Lock()
 		w.groupNames[jidStr] = cachedGroup{
 			name:      info.Name,
+			info:      info,
 			updatedAt: time.Now(),
 		}
 		w.groupMu.Unlock()
+		return info
+	}
+
+	return nil
+}
+
+func (w *WAClient) GetGroupName(jid types.JID) string {
+	info := w.GetGroupInfoCached(context.Background(), jid)
+	if info != nil && info.Name != "" {
 		return info.Name
 	}
 
-	// Fallback ke cache sebelumnya jika fetch info gagal/timeout
+	w.groupMu.RLock()
+	cached, exists := w.groupNames[jid.String()]
+	w.groupMu.RUnlock()
+
 	if exists && cached.name != "" {
 		return cached.name
 	}
@@ -335,13 +361,13 @@ func (w *WAClient) resolveSenderPhone(evt *events.Message) string {
 
 	// 3. Jika sender adalah @lid di grup, cari nomor asli di metadata peserta grup
 	if evt.Info.IsGroup {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		defer cancel()
-		info, err := w.client.GetGroupInfo(ctx, evt.Info.Chat)
-		if err == nil && info != nil {
-			senderJID := evt.Info.Sender
+		senderJID := evt.Info.Sender.ToNonAD()
+		info := w.GetGroupInfoCached(context.Background(), evt.Info.Chat)
+		if info != nil {
 			for _, p := range info.Participants {
-				if (p.JID == senderJID || p.LID == senderJID) && !p.PhoneNumber.IsEmpty() {
+				pJID := p.JID.ToNonAD()
+				pLID := p.LID.ToNonAD()
+				if (pJID == senderJID || pLID == senderJID || pJID.User == senderJID.User || pLID.User == senderJID.User) && !p.PhoneNumber.IsEmpty() {
 					return p.PhoneNumber.User
 				}
 			}
@@ -382,43 +408,128 @@ func (w *WAClient) isSenderOwner(evt *events.Message) bool {
 }
 
 func (w *WAClient) IsUserGroupAdmin(ctx context.Context, groupJID types.JID, evt *events.Message) bool {
+	if evt == nil {
+		return false
+	}
+
 	if w.isSenderOwner(evt) {
 		return true
 	}
 
-	info, err := w.client.GetGroupInfo(ctx, groupJID)
-	if err != nil || info == nil {
-		return false
-	}
+	senderJID := evt.Info.Sender.ToNonAD()
+	senderAlt := evt.Info.SenderAlt.ToNonAD()
+	senderPhone := w.resolveSenderPhone(evt)
 
-	senderJID := evt.Info.Sender
-	senderAlt := evt.Info.SenderAlt
-
-	for _, p := range info.Participants {
-		match := (p.JID == senderJID || p.LID == senderJID || p.PhoneNumber == senderJID)
-		if !match && !senderAlt.IsEmpty() {
-			match = (p.JID == senderAlt || p.LID == senderAlt || p.PhoneNumber == senderAlt)
-		}
-		if match && (p.IsAdmin || p.IsSuperAdmin) {
+	// 1. Cek di grup saat ini jika merupakan group chat
+	if groupJID.Server == types.GroupServer {
+		info := w.GetGroupInfoCached(ctx, groupJID)
+		if info != nil && w.checkParticipantAdmin(info, senderJID, senderAlt, senderPhone) {
 			return true
 		}
 	}
+
+	// 2. Jika bukan admin di grup saat ini atau jika perintah dijalankan di PM/DM,
+	// periksa apakah pengirim adalah admin di salah satu grup terkonfigurasi (GroupJIDs atau LogGroupJIDs)
+	var allGroups []string
+	allGroups = append(allGroups, w.config.GroupJIDs...)
+	allGroups = append(allGroups, w.config.LogGroupJIDs...)
+
+	for _, g := range allGroups {
+		clean := strings.TrimSpace(g)
+		if clean == "" {
+			continue
+		}
+		var gJID types.JID
+		if strings.Contains(clean, "@") {
+			gJID, _ = types.ParseJID(clean)
+		} else {
+			gJID = types.NewJID(clean, types.GroupServer)
+		}
+		if gJID.IsEmpty() || gJID == groupJID {
+			continue
+		}
+		info := w.GetGroupInfoCached(ctx, gJID)
+		if info != nil && w.checkParticipantAdmin(info, senderJID, senderAlt, senderPhone) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (w *WAClient) checkParticipantAdmin(info *types.GroupInfo, senderJID, senderAlt types.JID, senderPhone string) bool {
+	if info == nil {
+		return false
+	}
+
+	for _, p := range info.Participants {
+		if !p.IsAdmin && !p.IsSuperAdmin {
+			continue
+		}
+
+		pJID := p.JID.ToNonAD()
+		pLID := p.LID.ToNonAD()
+		pPhone := p.PhoneNumber.ToNonAD()
+
+		// A. Direct ToNonAD match (menghilangkan perbedaan Device ID multi-device)
+		if (!pJID.IsEmpty() && pJID == senderJID) ||
+			(!pLID.IsEmpty() && pLID == senderJID) ||
+			(!pPhone.IsEmpty() && pPhone == senderJID) {
+			return true
+		}
+
+		// B. Match senderAlt
+		if !senderAlt.IsEmpty() {
+			if (!pJID.IsEmpty() && pJID == senderAlt) ||
+				(!pLID.IsEmpty() && pLID == senderAlt) ||
+				(!pPhone.IsEmpty() && pPhone == senderAlt) {
+				return true
+			}
+		}
+
+		// C. Match by User identifier string (LID atau Nomor HP)
+		if (!pJID.IsEmpty() && pJID.User == senderJID.User) ||
+			(!pLID.IsEmpty() && pLID.User == senderJID.User) ||
+			(!pPhone.IsEmpty() && pPhone.User == senderJID.User) {
+			return true
+		}
+		if !senderAlt.IsEmpty() {
+			if (!pJID.IsEmpty() && pJID.User == senderAlt.User) ||
+				(!pLID.IsEmpty() && pLID.User == senderAlt.User) ||
+				(!pPhone.IsEmpty() && pPhone.User == senderAlt.User) {
+				return true
+			}
+		}
+
+		// D. Match resolved phone number
+		if senderPhone != "" {
+			if (!pPhone.IsEmpty() && isPhoneMatch(pPhone.User, senderPhone)) ||
+				(!pJID.IsEmpty() && isPhoneMatch(pJID.User, senderPhone)) {
+				return true
+			}
+		}
+	}
+
 	return false
 }
 
 func (w *WAClient) IsBotGroupAdmin(ctx context.Context, groupJID types.JID) bool {
-	if w.client.Store.ID == nil {
+	if w.client == nil || w.client.Store == nil || w.client.Store.ID == nil {
 		return false
 	}
 	botUser := w.client.Store.ID.User
 
-	info, err := w.client.GetGroupInfo(ctx, groupJID)
-	if err != nil || info == nil {
+	info := w.GetGroupInfoCached(ctx, groupJID)
+	if info == nil {
 		return false
 	}
 
 	for _, p := range info.Participants {
-		if (p.JID.User == botUser || p.PhoneNumber.User == botUser) && (p.IsAdmin || p.IsSuperAdmin) {
+		pJID := p.JID.ToNonAD()
+		pLID := p.LID.ToNonAD()
+		pPhone := p.PhoneNumber.ToNonAD()
+		isBot := pJID.User == botUser || pPhone.User == botUser || pLID.User == botUser
+		if isBot && (p.IsAdmin || p.IsSuperAdmin) {
 			return true
 		}
 	}

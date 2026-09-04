@@ -535,12 +535,13 @@ var (
 // ParseImageMapArgs mem-parsing argumen command imagemap.
 // Format yang didukung:
 // 1. Quoted/Caption Media:
-//    - `<name> <size_h> <size_w>` (contoh: `logo 2 2`)
-//    - `<name> <size_w>x<size_h>` (contoh: `logo 2x2`)
+//   - `<name> <size_h> <size_w>` (contoh: `logo 2 2`)
+//   - `<name> <size_w>x<size_h>` (contoh: `logo 2x2`)
+//
 // 2. Teks biasa dengan Link URL:
-//    - `<url> <name> <size_h> <size_w>`
-//    - `<url> <name> <size_w>x<size_h>`
-//    - `<name> <size_w>x<size_h> <url>`
+//   - `<url> <name> <size_h> <size_w>`
+//   - `<url> <name> <size_w>x<size_h>`
+//   - `<name> <size_w>x<size_h> <url>`
 func ParseImageMapArgs(rawArgs string, hasMedia bool) (imgURL, mapName string, width, height int, err error) {
 	allTokens := strings.Fields(strings.TrimSpace(rawArgs))
 	if len(allTokens) == 0 {

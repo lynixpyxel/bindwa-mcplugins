@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 func TestRulesManager(t *testing.T) {
@@ -110,3 +113,83 @@ func TestPhoneMatchingAndMentions(t *testing.T) {
 		t.Errorf("Short numbers should NOT trigger mentions, got %v", m4)
 	}
 }
+
+func TestIsUserGroupAdminMultiDeviceAndLID(t *testing.T) {
+	groupJID := types.NewJID("120363040000000000", types.GroupServer)
+	adminPhone := "6285294959195"
+	adminLID := "109876543210"
+
+	groupInfo := &types.GroupInfo{
+		JID: groupJID,
+		Participants: []types.GroupParticipant{
+			{
+				JID:         types.NewJID(adminPhone, types.DefaultUserServer),
+				LID:         types.NewJID(adminLID, types.HiddenUserServer),
+				PhoneNumber: types.NewJID(adminPhone, types.DefaultUserServer),
+				IsAdmin:     true,
+			},
+			{
+				JID:         types.NewJID("6281234567890", types.DefaultUserServer),
+				PhoneNumber: types.NewJID("6281234567890", types.DefaultUserServer),
+				IsAdmin:     false,
+			},
+		},
+	}
+
+	w := &WAClient{
+		config: Config{
+			OwnerNumber: "6289999999999",
+			GroupJIDs:   []string{groupJID.String()},
+		},
+		groupNames: map[string]cachedGroup{
+			groupJID.String(): {
+				name:      "Test Group",
+				info:      groupInfo,
+				updatedAt: time.Now(),
+			},
+		},
+	}
+
+	// Case 1: Sender has device ID != 0 (e.g. multi-device WhatsApp: 6285294959195:12@s.whatsapp.net)
+	evtMD := &events.Message{}
+	evtMD.Info.Sender = types.JID{
+		User:   adminPhone,
+		Device: 12,
+		Server: types.DefaultUserServer,
+	}
+	if !w.IsUserGroupAdmin(context.Background(), groupJID, evtMD) {
+		t.Errorf("Expected multi-device admin to be recognized as admin")
+	}
+
+	// Case 2: Sender uses LID with Device ID (e.g. 109876543210:2@lid)
+	evtLID := &events.Message{}
+	evtLID.Info.Sender = types.JID{
+		User:   adminLID,
+		Device: 2,
+		Server: types.HiddenUserServer,
+	}
+	if !w.IsUserGroupAdmin(context.Background(), groupJID, evtLID) {
+		t.Errorf("Expected LID sender to be recognized as admin")
+	}
+
+	// Case 3: Admin executing command in Private Chat (DM with bot)
+	dmJID := types.NewJID(adminPhone, types.DefaultUserServer)
+	if !w.IsUserGroupAdmin(context.Background(), dmJID, evtMD) {
+		t.Errorf("Expected group admin executing in DM to be recognized across configured groups")
+	}
+
+	// Case 4: Non-admin member should not be admin
+	evtNonAdmin := &events.Message{}
+	evtNonAdmin.Info.Sender = types.NewJID("6281234567890", types.DefaultUserServer)
+	if w.IsUserGroupAdmin(context.Background(), groupJID, evtNonAdmin) {
+		t.Errorf("Expected regular member NOT to be recognized as admin")
+	}
+
+	// Case 5: Owner should always be admin even if not in group
+	evtOwner := &events.Message{}
+	evtOwner.Info.Sender = types.NewJID("6289999999999", types.DefaultUserServer)
+	if !w.IsUserGroupAdmin(context.Background(), groupJID, evtOwner) {
+		t.Errorf("Expected bot owner to be recognized as admin")
+	}
+}
+
