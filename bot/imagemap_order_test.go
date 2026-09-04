@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/skip2/go-qrcode"
+	waProto "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestParseImageMapArgs(t *testing.T) {
@@ -362,4 +365,113 @@ func TestExtractOrderIDFromRegex(t *testing.T) {
 		}
 	}
 }
+
+func TestButtonsMessageStructure(t *testing.T) {
+	buttons := []InteractiveButtonDef{
+		{Text: "Setujui (ACC)", ID: ".acc MAP-ABCD"},
+		{Text: "Tolak (Decline)", ID: ".decline MAP-ABCD"},
+	}
+
+	imageMsg := &waProto.ImageMessage{
+		Mimetype: proto.String("image/png"),
+	}
+
+	var waButtons []*waProto.ButtonsMessage_Button
+	for _, b := range buttons {
+		waButtons = append(waButtons, &waProto.ButtonsMessage_Button{
+			ButtonID: proto.String(b.ID),
+			ButtonText: &waProto.ButtonsMessage_Button_ButtonText{
+				DisplayText: proto.String(b.Text),
+			},
+			Type: waProto.ButtonsMessage_Button_RESPONSE.Enum(),
+		})
+	}
+
+	buttonsMsg := &waProto.ButtonsMessage{
+		Header: &waProto.ButtonsMessage_ImageMessage{
+			ImageMessage: imageMsg,
+		},
+		HeaderType:  waProto.ButtonsMessage_IMAGE.Enum(),
+		ContentText: proto.String("Rincian Pesanan MAP-ABCD"),
+		FooterText:  proto.String("Footer"),
+		Buttons:     waButtons,
+	}
+
+	msg := &waProto.Message{
+		ButtonsMessage: buttonsMsg,
+	}
+
+	// Verify ButtonsMessage fields
+	if msg.GetButtonsMessage() == nil {
+		t.Fatalf("expected ButtonsMessage not to be nil")
+	}
+	bm := msg.GetButtonsMessage()
+	if bm.GetHeaderType() != waProto.ButtonsMessage_IMAGE {
+		t.Errorf("expected headerType IMAGE, got %v", bm.GetHeaderType())
+	}
+	if bm.GetImageMessage() == nil {
+		t.Errorf("expected ImageMessage in header, got nil")
+	}
+	if len(bm.GetButtons()) != 2 {
+		t.Fatalf("expected 2 buttons, got %d", len(bm.GetButtons()))
+	}
+	if bm.GetButtons()[0].GetButtonID() != ".acc MAP-ABCD" {
+		t.Errorf("expected button 0 id .acc MAP-ABCD, got %s", bm.GetButtons()[0].GetButtonID())
+	}
+	if bm.GetButtons()[0].GetButtonText().GetDisplayText() != "Setujui (ACC)" {
+		t.Errorf("expected button 0 text Setujui (ACC), got %s", bm.GetButtons()[0].GetButtonText().GetDisplayText())
+	}
+	if bm.GetButtons()[1].GetButtonID() != ".decline MAP-ABCD" {
+		t.Errorf("expected button 1 id .decline MAP-ABCD, got %s", bm.GetButtons()[1].GetButtonID())
+	}
+}
+
+func TestExtractOrderIDFromQuotedButtons(t *testing.T) {
+	w := &WAClient{}
+
+	// Test 1: Quoted ButtonsMessage
+	evtWithButtonsQuote := &events.Message{
+		Message: &waProto.Message{
+			ButtonsResponseMessage: &waProto.ButtonsResponseMessage{
+				SelectedButtonID: proto.String(".acc MAP-1234"),
+				ContextInfo: &waProto.ContextInfo{
+					QuotedMessage: &waProto.Message{
+						ButtonsMessage: &waProto.ButtonsMessage{
+							ContentText: proto.String("Rincian Pesanan:\nOrder ID : MAP-1234\nPengirim : 628123"),
+						},
+					},
+				},
+			},
+		},
+	}
+	extracted := w.extractOrderIDFromEvent(evtWithButtonsQuote)
+	if extracted != "MAP-1234" {
+		t.Errorf("expected MAP-1234 extracted from quoted buttons message, got %s", extracted)
+	}
+
+	// Test 2: Quoted TemplateMessage
+	evtWithTemplateQuote := &events.Message{
+		Message: &waProto.Message{
+			TemplateButtonReplyMessage: &waProto.TemplateButtonReplyMessage{
+				SelectedID: proto.String(".decline MAP-5678"),
+				ContextInfo: &waProto.ContextInfo{
+					QuotedMessage: &waProto.Message{
+						TemplateMessage: &waProto.TemplateMessage{
+							Format: &waProto.TemplateMessage_HydratedFourRowTemplate_{
+								HydratedFourRowTemplate: &waProto.TemplateMessage_HydratedFourRowTemplate{
+									HydratedContentText: proto.String("Rincian Pesanan:\nOrder ID : MAP-5678"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	extracted = w.extractOrderIDFromEvent(evtWithTemplateQuote)
+	if extracted != "MAP-5678" {
+		t.Errorf("expected MAP-5678 extracted from quoted template message, got %s", extracted)
+	}
+}
+
 

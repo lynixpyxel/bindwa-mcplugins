@@ -461,8 +461,14 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		text = doc.GetCaption()
 	} else if btnResp := evt.Message.GetButtonsResponseMessage(); btnResp != nil {
 		text = btnResp.GetSelectedButtonID()
+		if text == "" {
+			text = btnResp.GetSelectedDisplayText()
+		}
 	} else if tmplResp := evt.Message.GetTemplateButtonReplyMessage(); tmplResp != nil {
 		text = tmplResp.GetSelectedID()
+		if text == "" {
+			text = tmplResp.GetSelectedDisplayText()
+		}
 	} else if interResp := evt.Message.GetInteractiveResponseMessage(); interResp != nil && interResp.GetNativeFlowResponseMessage() != nil {
 		paramsJSON := interResp.GetNativeFlowResponseMessage().GetParamsJSON()
 		var parsed struct {
@@ -476,6 +482,15 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	}
 
 	text = strings.TrimSpace(text)
+	lowerText := strings.ToLower(text)
+	if strings.HasPrefix(lowerText, "setujui") {
+		text = ".acc"
+	} else if strings.HasPrefix(lowerText, "tolak") {
+		text = ".decline"
+	} else if strings.HasPrefix(lowerText, "batalkan pesanan") {
+		text = ".cancelmap"
+	}
+
 	if text == "" {
 		return
 	}
@@ -511,10 +526,10 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	case "cancelmap", "cancelorder":
 		go w.CancelUserPendingOrder(ctx, evt)
 
-	case "acc", "approve":
+	case "acc", "approve", "setujui":
 		go w.HandleApproveImageMap(ctx, evt, args)
 
-	case "decline", "reject":
+	case "decline", "reject", "tolak":
 		go w.HandleDeclineImageMap(ctx, evt, args)
 
 	case "mccmdlist", "mccmd", "cmdlist", "mccommands", "commandlist":

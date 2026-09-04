@@ -586,8 +586,10 @@ type InteractiveButtonDef struct {
 	ID   string
 }
 
-// SendImageInteractiveButtons mengirim gambar disertai tombol interactive quick reply ke WhatsApp.
-func (w *WAClient) SendImageInteractiveButtons(ctx context.Context, jid types.JID, imageBytes []byte, captionTitle, bodyText, footerText string, buttons []InteractiveButtonDef) error {
+// SendImageButtons mengirim gambar disertai tombol interactive ke WhatsApp.
+// Menggunakan struktur ButtonsMessage sesuai implementasi Baileys dan order-modules.js,
+// dengan fallback berjenjang ke TemplateMessage, InteractiveMessage (tanpa viewOnce), dan standard image.
+func (w *WAClient) SendImageButtons(ctx context.Context, jid types.JID, imageBytes []byte, captionTitle, bodyText, footerText string, buttons []InteractiveButtonDef) error {
 	if !w.IsReady() {
 		return ErrWANotConnected
 	}
@@ -607,6 +609,84 @@ func (w *WAClient) SendImageInteractiveButtons(ctx context.Context, jid types.JI
 		Mimetype:      proto.String("image/png"),
 	}
 
+	fullCaption := bodyText
+	if captionTitle != "" {
+		fullCaption = "*" + captionTitle + "*\n\n" + bodyText
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	// 1. Metode Utama: ButtonsMessage (Baileys & order-modules.js)
+	var waButtons []*waProto.ButtonsMessage_Button
+	for _, b := range buttons {
+		waButtons = append(waButtons, &waProto.ButtonsMessage_Button{
+			ButtonID: proto.String(b.ID),
+			ButtonText: &waProto.ButtonsMessage_Button_ButtonText{
+				DisplayText: proto.String(b.Text),
+			},
+			Type: waProto.ButtonsMessage_Button_RESPONSE.Enum(),
+		})
+	}
+
+	buttonsMsg := &waProto.ButtonsMessage{
+		Header: &waProto.ButtonsMessage_ImageMessage{
+			ImageMessage: imageMsg,
+		},
+		HeaderType:  waProto.ButtonsMessage_IMAGE.Enum(),
+		ContentText: proto.String(fullCaption),
+		FooterText:  proto.String(footerText),
+		Buttons:     waButtons,
+	}
+
+	_, err = w.client.SendMessage(sendCtx, jid, &waProto.Message{
+		ButtonsMessage: buttonsMsg,
+	})
+	if err == nil {
+		return nil
+	}
+
+	fmt.Printf("[WA-Buttons] ButtonsMessage error (%v), mencoba TemplateMessage...\n", err)
+
+	// 2. Fallback: TemplateMessage (HydratedFourRowTemplate dari Baileys)
+	var hydratedButtons []*waProto.HydratedTemplateButton
+	for i, b := range buttons {
+		idx := uint32(i + 1)
+		hydratedButtons = append(hydratedButtons, &waProto.HydratedTemplateButton{
+			Index: &idx,
+			HydratedButton: &waProto.HydratedTemplateButton_QuickReplyButton{
+				QuickReplyButton: &waProto.HydratedTemplateButton_HydratedQuickReplyButton{
+					DisplayText: proto.String(b.Text),
+					ID:          proto.String(b.ID),
+				},
+			},
+		})
+	}
+
+	templateMsg := &waProto.TemplateMessage{
+		Format: &waProto.TemplateMessage_HydratedFourRowTemplate_{
+			HydratedFourRowTemplate: &waProto.TemplateMessage_HydratedFourRowTemplate{
+				Title: &waProto.TemplateMessage_HydratedFourRowTemplate_ImageMessage{
+					ImageMessage: imageMsg,
+				},
+				HydratedContentText: proto.String(fullCaption),
+				HydratedFooterText:  proto.String(footerText),
+				HydratedButtons:     hydratedButtons,
+				TemplateID:          proto.String(fmt.Sprintf("tpl-%d", time.Now().UnixNano())),
+			},
+		},
+	}
+
+	_, err = w.client.SendMessage(sendCtx, jid, &waProto.Message{
+		TemplateMessage: templateMsg,
+	})
+	if err == nil {
+		return nil
+	}
+
+	fmt.Printf("[WA-Buttons] TemplateMessage error (%v), mencoba InteractiveMessage langsung (tanpa viewOnce)...\n", err)
+
+	// 3. Fallback: InteractiveMessage langsung (tanpa ViewOnce)
 	var nativeButtons []*waProto.InteractiveMessage_NativeFlowMessage_NativeFlowButton
 	for _, b := range buttons {
 		btnJSON := fmt.Sprintf(`{"display_text":%q,"id":%q}`, b.Text, b.ID)
@@ -637,28 +717,26 @@ func (w *WAClient) SendImageInteractiveButtons(ctx context.Context, jid types.JI
 		},
 	}
 
-	msg := &waProto.Message{
-		ViewOnceMessage: &waProto.FutureProofMessage{
-			Message: &waProto.Message{
-				InteractiveMessage: interactiveMsg,
-			},
-		},
+	_, err = w.client.SendMessage(sendCtx, jid, &waProto.Message{
+		InteractiveMessage: interactiveMsg,
+	})
+	if err == nil {
+		return nil
 	}
 
-	sendCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
+	fmt.Printf("[WA-Buttons] InteractiveMessage error (%v), fallback ke standard image...\n", err)
 
-	_, err = w.client.SendMessage(sendCtx, jid, msg)
-	if err != nil {
-		fmt.Printf("[WA-Moderation] Interactive message error (%v), fallback ke standard image...\n", err)
-		fallbackCaption := captionTitle + "\n\n" + bodyText
-		if footerText != "" {
-			fallbackCaption += "\n\n" + footerText
-		}
-		return w.SendImageReply(ctx, jid, imageBytes, "image/png", fallbackCaption, nil)
+	// 4. Fallback Terakhir: Standard Image dengan caption lengkap
+	fallbackCaption := fullCaption
+	if footerText != "" {
+		fallbackCaption += "\n\n" + footerText
 	}
+	return w.SendImageReply(ctx, jid, imageBytes, "image/png", fallbackCaption, nil)
+}
 
-	return nil
+// SendImageInteractiveButtons alias untuk kompatibilitas ke SendImageButtons.
+func (w *WAClient) SendImageInteractiveButtons(ctx context.Context, jid types.JID, imageBytes []byte, captionTitle, bodyText, footerText string, buttons []InteractiveButtonDef) error {
+	return w.SendImageButtons(ctx, jid, imageBytes, captionTitle, bodyText, footerText, buttons)
 }
 
 func (w *WAClient) getModerationTargets() []types.JID {
@@ -689,19 +767,41 @@ func (w *WAClient) getModerationTargets() []types.JID {
 var orderIDRegex = regexp.MustCompile(`(?i)\bMAP-[A-F0-9]+\b`)
 
 func (w *WAClient) extractOrderIDFromEvent(evt *events.Message) string {
+	var ctxInfo *waProto.ContextInfo
 	if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
-		if ctxInfo := ext.GetContextInfo(); ctxInfo != nil {
-			if qm := ctxInfo.GetQuotedMessage(); qm != nil {
-				text := qm.GetConversation()
-				if text == "" && qm.GetExtendedTextMessage() != nil {
-					text = qm.GetExtendedTextMessage().GetText()
+		ctxInfo = ext.GetContextInfo()
+	} else if btn := evt.Message.GetButtonsResponseMessage(); btn != nil {
+		ctxInfo = btn.GetContextInfo()
+	} else if tmpl := evt.Message.GetTemplateButtonReplyMessage(); tmpl != nil {
+		ctxInfo = tmpl.GetContextInfo()
+	} else if img := evt.Message.GetImageMessage(); img != nil {
+		ctxInfo = img.GetContextInfo()
+	} else if inter := evt.Message.GetInteractiveResponseMessage(); inter != nil {
+		ctxInfo = inter.GetContextInfo()
+	}
+
+	if ctxInfo != nil {
+		if qm := ctxInfo.GetQuotedMessage(); qm != nil {
+			text := qm.GetConversation()
+			if text == "" && qm.GetExtendedTextMessage() != nil {
+				text = qm.GetExtendedTextMessage().GetText()
+			}
+			if text == "" && qm.GetImageMessage() != nil {
+				text = qm.GetImageMessage().GetCaption()
+			}
+			if text == "" && qm.GetButtonsMessage() != nil {
+				text = qm.GetButtonsMessage().GetContentText()
+			}
+			if text == "" && qm.GetTemplateMessage() != nil {
+				if h := qm.GetTemplateMessage().GetHydratedFourRowTemplate(); h != nil {
+					text = h.GetHydratedContentText()
 				}
-				if text == "" && qm.GetImageMessage() != nil {
-					text = qm.GetImageMessage().GetCaption()
-				}
-				if match := orderIDRegex.FindString(text); match != "" {
-					return strings.ToUpper(match)
-				}
+			}
+			if text == "" && qm.GetInteractiveMessage() != nil && qm.GetInteractiveMessage().GetBody() != nil {
+				text = qm.GetInteractiveMessage().GetBody().GetText()
+			}
+			if match := orderIDRegex.FindString(text); match != "" {
+				return strings.ToUpper(match)
 			}
 		}
 	}
@@ -907,8 +1007,9 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 
 	cancelCh := w.imagemapManager.ApproveOrder(order.PaymentID, qrisResp.Data.TransactionID, qrisResp.Data.TotalAmount)
 
-	// Kirim QRIS dan instruksi pembayaran ke pemesan
+	// Kirim QRIS dan instruksi pembayaran ke pemesan (disertai tombol Batalkan Pesanan sesuai order-modules.js)
 	userChatJID, _ := types.ParseJID(order.ChatJID)
+	paymentTitle := "PEMBAYARAN IMAGEMAP"
 	paymentCaption := fmt.Sprintf("Pesanan imagemap Anda telah disetujui oleh admin.\n\n"+
 		"Rincian Pembayaran:\n"+
 		"Nama Map    : %s\n"+
@@ -924,7 +1025,11 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 		order.MapName, order.Width, order.Height, order.TotalTiles,
 		formatRupiah(qrisResp.Data.TotalAmount), order.PaymentID, qrisResp.Data.ExpiredInMinutes)
 
-	err = w.SendImageReply(ctx, userChatJID, qrPNG, "image/png", paymentCaption, nil)
+	userButtons := []InteractiveButtonDef{
+		{Text: "Batalkan Pesanan", ID: ".cancelmap"},
+	}
+
+	err = w.SendImageButtons(ctx, userChatJID, qrPNG, paymentTitle, paymentCaption, "Scan QRIS di atas untuk membayar", userButtons)
 	if err != nil {
 		fmt.Printf("[WA-ImageMap] Gagal kirim gambar QR ke %s (%v), kirim teks fallback...\n", order.ChatJID, err)
 		_ = w.SendToJID(ctx, userChatJID, paymentCaption)
