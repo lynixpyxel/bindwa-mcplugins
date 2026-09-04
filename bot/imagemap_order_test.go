@@ -472,6 +472,26 @@ func TestExtractOrderIDFromQuotedButtons(t *testing.T) {
 	if extracted != "MAP-5678" {
 		t.Errorf("expected MAP-5678 extracted from quoted template message, got %s", extracted)
 	}
+
+	// Test 3: Quoted ImageMessage (standard moderation image message reply)
+	evtWithImageQuote := &events.Message{
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("acc"),
+				ContextInfo: &waProto.ContextInfo{
+					QuotedMessage: &waProto.Message{
+						ImageMessage: &waProto.ImageMessage{
+							Caption: proto.String("Ada Order Gambar Baru!\n\nRincian Pesanan:\nOrder ID    : MAP-9ABC\nPengirim    : 628123456\nNama Map    : logo\nUkuran      : 2x2 (4 tile)\nTotal Biaya : Rp 4.000\n\nCara Moderasi:\nReply pesan ini dengan ketik:\n- acc : untuk menyetujui pesanan\n- reject [alasan] : untuk menolak pesanan"),
+						},
+					},
+				},
+			},
+		},
+	}
+	extracted = w.extractOrderIDFromEvent(evtWithImageQuote)
+	if extracted != "MAP-9ABC" {
+		t.Errorf("expected MAP-9ABC extracted from quoted image message caption, got %s", extracted)
+	}
 }
 
 

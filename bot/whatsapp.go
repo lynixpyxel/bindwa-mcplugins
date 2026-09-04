@@ -482,15 +482,6 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	}
 
 	text = strings.TrimSpace(text)
-	lowerText := strings.ToLower(text)
-	if strings.HasPrefix(lowerText, "setujui") {
-		text = ".acc"
-	} else if strings.HasPrefix(lowerText, "tolak") {
-		text = ".decline"
-	} else if strings.HasPrefix(lowerText, "batalkan pesanan") {
-		text = ".cancelmap"
-	}
-
 	if text == "" {
 		return
 	}
@@ -504,7 +495,57 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 	w.recordParticipant(pushName, senderPhone, evt.Info.Sender.String())
 
-	prefix, cmd, args, isCmd := w.parseCommand(text)
+	// Deteksi apakah pesan adalah tindakan moderasi ImageMap (reply atau perintah langsung dengan/tanpa prefix)
+	orderID := w.extractOrderIDFromEvent(evt)
+	fields := strings.Fields(text)
+	var prefix, cmd, args string
+	var isCmd bool
+
+	if len(fields) > 0 {
+		firstWord := strings.ToLower(fields[0])
+		firstWordClean := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(firstWord, "."), "/"), "!")
+
+		switch firstWordClean {
+		case "acc", "approve", "setujui":
+			isCmd = true
+			cmd = "acc"
+			prefix = "."
+			if len(fields) > 1 && strings.HasPrefix(strings.ToUpper(fields[1]), "MAP-") {
+				args = fields[1]
+			} else if orderID != "" {
+				args = orderID
+			} else if len(fields) > 1 {
+				args = fields[1]
+			}
+
+		case "reject", "decline", "tolak":
+			isCmd = true
+			cmd = "decline"
+			prefix = "."
+			if len(fields) > 1 && strings.HasPrefix(strings.ToUpper(fields[1]), "MAP-") {
+				args = fields[1]
+				if len(fields) > 2 {
+					args += " " + strings.Join(fields[2:], " ")
+				}
+			} else if orderID != "" {
+				args = orderID
+				if len(fields) > 1 {
+					args += " " + strings.Join(fields[1:], " ")
+				}
+			} else {
+				args = strings.Join(fields[1:], " ")
+			}
+		}
+	}
+
+	if !isCmd {
+		prefix, cmd, args, isCmd = w.parseCommand(text)
+	}
+
+	if prefix == "" {
+		prefix = "."
+	}
+
 	if !isCmd {
 		// Jika pesan bukan command, cek apakah me-reply pesan dari bot di grup yang terhubung
 		if evt.Info.IsGroup && w.isGroupLinked(chatJID) && w.isReplyingToBot(evt) {
@@ -1526,14 +1567,15 @@ func (w *WAClient) SendImageWithMentions(ctx context.Context, jid types.JID, ima
 	return err
 }
 
-func (w *WAClient) SendImageReply(ctx context.Context, jid types.JID, imageBytes []byte, mimeType string, caption string, replyEvt *events.Message) error {
+// SendImageReplyWithID mengirim gambar dan mengembalikan ID pesan yang terkirim.
+func (w *WAClient) SendImageReplyWithID(ctx context.Context, jid types.JID, imageBytes []byte, mimeType string, caption string, replyEvt *events.Message) (string, error) {
 	if !w.IsReady() {
-		return ErrWANotConnected
+		return "", ErrWANotConnected
 	}
 
 	uploadResp, err := w.client.Upload(ctx, imageBytes, whatsmeow.MediaImage)
 	if err != nil {
-		return fmt.Errorf("failed to upload image: %w", err)
+		return "", fmt.Errorf("failed to upload image: %w", err)
 	}
 
 	if mimeType == "" {
@@ -1566,9 +1608,30 @@ func (w *WAClient) SendImageReply(ctx context.Context, jid types.JID, imageBytes
 	sendCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
-	_, err = w.client.SendMessage(sendCtx, jid, &waProto.Message{
+	resp, err := w.client.SendMessage(sendCtx, jid, &waProto.Message{
 		ImageMessage: imageMsg,
 	})
+	if err != nil {
+		return "", err
+	}
+	return string(resp.ID), nil
+}
+
+// SendImageReply mengirim gambar disertai caption.
+func (w *WAClient) SendImageReply(ctx context.Context, jid types.JID, imageBytes []byte, mimeType string, caption string, replyEvt *events.Message) error {
+	_, err := w.SendImageReplyWithID(ctx, jid, imageBytes, mimeType, caption, replyEvt)
+	return err
+}
+
+// DeleteMessage menghapus atau me-revoke pesan yang pernah dikirimkan oleh bot.
+func (w *WAClient) DeleteMessage(ctx context.Context, chat types.JID, messageID string) error {
+	if !w.IsReady() || messageID == "" {
+		return ErrWANotConnected
+	}
+	revokeMsg := w.client.BuildRevoke(chat, types.EmptyJID, types.MessageID(messageID))
+	sendCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err := w.client.SendMessage(sendCtx, chat, revokeMsg)
 	return err
 }
 

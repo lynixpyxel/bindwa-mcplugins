@@ -184,6 +184,7 @@ type ImageMapOrder struct {
 	SenderJID     string    `json:"sender_jid"`
 	ChatJID       string    `json:"chat_jid"`
 	OriginalMsgID string    `json:"original_msg_id,omitempty"`
+	QRMessageID   string    `json:"qr_message_id,omitempty"`
 	MapName       string    `json:"map_name"`
 	Width         int       `json:"width"`
 	Height        int       `json:"height"`
@@ -766,43 +767,94 @@ func (w *WAClient) getModerationTargets() []types.JID {
 
 var orderIDRegex = regexp.MustCompile(`(?i)\bMAP-[A-F0-9]+\b`)
 
-func (w *WAClient) extractOrderIDFromEvent(evt *events.Message) string {
-	var ctxInfo *waProto.ContextInfo
-	if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
-		ctxInfo = ext.GetContextInfo()
-	} else if btn := evt.Message.GetButtonsResponseMessage(); btn != nil {
-		ctxInfo = btn.GetContextInfo()
-	} else if tmpl := evt.Message.GetTemplateButtonReplyMessage(); tmpl != nil {
-		ctxInfo = tmpl.GetContextInfo()
-	} else if img := evt.Message.GetImageMessage(); img != nil {
-		ctxInfo = img.GetContextInfo()
-	} else if inter := evt.Message.GetInteractiveResponseMessage(); inter != nil {
-		ctxInfo = inter.GetContextInfo()
+func (w *WAClient) extractContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	if msg == nil {
+		return nil
 	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil && ext.GetContextInfo() != nil {
+		return ext.GetContextInfo()
+	}
+	if img := msg.GetImageMessage(); img != nil && img.GetContextInfo() != nil {
+		return img.GetContextInfo()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil && doc.GetContextInfo() != nil {
+		return doc.GetContextInfo()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil && vid.GetContextInfo() != nil {
+		return vid.GetContextInfo()
+	}
+	if btn := msg.GetButtonsResponseMessage(); btn != nil && btn.GetContextInfo() != nil {
+		return btn.GetContextInfo()
+	}
+	if tmpl := msg.GetTemplateButtonReplyMessage(); tmpl != nil && tmpl.GetContextInfo() != nil {
+		return tmpl.GetContextInfo()
+	}
+	if inter := msg.GetInteractiveResponseMessage(); inter != nil && inter.GetContextInfo() != nil {
+		return inter.GetContextInfo()
+	}
+	if eph := msg.GetEphemeralMessage(); eph != nil && eph.GetMessage() != nil {
+		return w.extractContextInfo(eph.GetMessage())
+	}
+	if vo := msg.GetViewOnceMessage(); vo != nil && vo.GetMessage() != nil {
+		return w.extractContextInfo(vo.GetMessage())
+	}
+	if voV2 := msg.GetViewOnceMessageV2(); voV2 != nil && voV2.GetMessage() != nil {
+		return w.extractContextInfo(voV2.GetMessage())
+	}
+	return nil
+}
 
-	if ctxInfo != nil {
-		if qm := ctxInfo.GetQuotedMessage(); qm != nil {
-			text := qm.GetConversation()
-			if text == "" && qm.GetExtendedTextMessage() != nil {
-				text = qm.GetExtendedTextMessage().GetText()
-			}
-			if text == "" && qm.GetImageMessage() != nil {
-				text = qm.GetImageMessage().GetCaption()
-			}
-			if text == "" && qm.GetButtonsMessage() != nil {
-				text = qm.GetButtonsMessage().GetContentText()
-			}
-			if text == "" && qm.GetTemplateMessage() != nil {
-				if h := qm.GetTemplateMessage().GetHydratedFourRowTemplate(); h != nil {
-					text = h.GetHydratedContentText()
-				}
-			}
-			if text == "" && qm.GetInteractiveMessage() != nil && qm.GetInteractiveMessage().GetBody() != nil {
-				text = qm.GetInteractiveMessage().GetBody().GetText()
-			}
-			if match := orderIDRegex.FindString(text); match != "" {
-				return strings.ToUpper(match)
-			}
+func (w *WAClient) extractTextFromMessage(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if conv := msg.GetConversation(); conv != "" {
+		return conv
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil && ext.GetText() != "" {
+		return ext.GetText()
+	}
+	if img := msg.GetImageMessage(); img != nil && img.GetCaption() != "" {
+		return img.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
+		return doc.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil && vid.GetCaption() != "" {
+		return vid.GetCaption()
+	}
+	if bm := msg.GetButtonsMessage(); bm != nil && bm.GetContentText() != "" {
+		return bm.GetContentText()
+	}
+	if tm := msg.GetTemplateMessage(); tm != nil {
+		if h := tm.GetHydratedFourRowTemplate(); h != nil && h.GetHydratedContentText() != "" {
+			return h.GetHydratedContentText()
+		}
+	}
+	if im := msg.GetInteractiveMessage(); im != nil && im.GetBody() != nil && im.GetBody().GetText() != "" {
+		return im.GetBody().GetText()
+	}
+	if eph := msg.GetEphemeralMessage(); eph != nil && eph.GetMessage() != nil {
+		return w.extractTextFromMessage(eph.GetMessage())
+	}
+	if vo := msg.GetViewOnceMessage(); vo != nil && vo.GetMessage() != nil {
+		return w.extractTextFromMessage(vo.GetMessage())
+	}
+	if voV2 := msg.GetViewOnceMessageV2(); voV2 != nil && voV2.GetMessage() != nil {
+		return w.extractTextFromMessage(voV2.GetMessage())
+	}
+	return ""
+}
+
+func (w *WAClient) extractOrderIDFromEvent(evt *events.Message) string {
+	if evt == nil || evt.Message == nil {
+		return ""
+	}
+	ctxInfo := w.extractContextInfo(evt.Message)
+	if ctxInfo != nil && ctxInfo.GetQuotedMessage() != nil {
+		text := w.extractTextFromMessage(ctxInfo.GetQuotedMessage())
+		if match := orderIDRegex.FindString(text); match != "" {
+			return strings.ToUpper(match)
 		}
 	}
 	return ""
@@ -916,44 +968,41 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 
 	_ = w.SendReplyToGroup(ctx, chatJID, userAckMsg, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 
-	// 8. Kirim notifikasi moderasi ke grup log atau owner
+	// 8. Kirim notifikasi moderasi ke grup log atau owner (menggunakan pesan gambar biasa dengan caption)
 	originName := w.GetGroupName(chatJID)
 	if originName == "" || !evt.Info.IsGroup {
 		originName = fmt.Sprintf("Chat Pribadi (%s)", senderPhone)
 	}
 
-	modTitle := "Ada Order Gambar Baru!"
-	modBody := fmt.Sprintf("Rincian Pesanan:\n"+
+	modCaption := fmt.Sprintf("Ada Order Gambar Baru!\n\n"+
+		"Rincian Pesanan:\n"+
 		"Order ID    : %s\n"+
 		"Pengirim    : %s\n"+
 		"Nama Map    : %s\n"+
 		"Ukuran      : %dx%d (%d tile)\n"+
 		"Total Biaya : Rp %s\n"+
 		"Asal Chat   : %s\n\n"+
-		"Apakah ingin menyetujui (ACC) atau menolak (decline) pesanan gambar ini?\n\n"+
-		"Pilihan Tindakan:\n"+
-		"- Setujui : .acc %s\n"+
-		"- Tolak   : .decline %s [alasan opsional]",
+		"Cara Moderasi:\n"+
+		"Reply pesan ini dengan ketik:\n"+
+		"- acc : untuk menyetujui pesanan\n"+
+		"- reject [alasan] : untuk menolak pesanan\n\n"+
+		"Atau ketik langsung:\n"+
+		"- .acc %s\n"+
+		"- .decline %s [alasan]",
 		order.PaymentID, order.SenderPhone, order.MapName,
 		order.Width, order.Height, order.TotalTiles,
 		formatRupiah(order.Amount), originName,
 		order.PaymentID, order.PaymentID)
 
-	modFooter := "Gunakan tombol di bawah atau ketik perintah di atas"
-	buttons := []InteractiveButtonDef{
-		{Text: "Setujui (ACC)", ID: ".acc " + order.PaymentID},
-		{Text: "Tolak (Decline)", ID: ".decline " + order.PaymentID},
-	}
-
 	targets := w.getModerationTargets()
 	for _, target := range targets {
-		if err := w.SendImageInteractiveButtons(ctx, target, imgBytes, modTitle, modBody, modFooter, buttons); err != nil {
+		if err := w.SendImageReply(ctx, target, imgBytes, "image/png", modCaption, nil); err != nil {
 			fmt.Printf("[WA-Moderation] Gagal mengirim pesan moderasi ke %s: %v\n", target.String(), err)
 		}
 	}
 }
 
-// HandleApproveImageMap menangani persetujuan pesanan oleh admin (.acc <orderID>).
+// HandleApproveImageMap menangani persetujuan pesanan oleh admin (.acc <orderID> atau reply 'acc').
 func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Message, rawArgs string) {
 	chatJID := evt.Info.Chat
 
@@ -963,15 +1012,17 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 	}
 
 	orderID := strings.TrimSpace(rawArgs)
-	if orderID == "" {
-		orderID = w.extractOrderIDFromEvent(evt)
+	if orderID == "" || !strings.HasPrefix(strings.ToUpper(orderID), "MAP-") {
+		if fromEvent := w.extractOrderIDFromEvent(evt); fromEvent != "" {
+			orderID = fromEvent
+		}
 	}
 	if parts := strings.Fields(orderID); len(parts) > 0 {
 		orderID = parts[0]
 	}
 
 	if orderID == "" {
-		_ = w.SendReplyToGroup(ctx, chatJID, "Format salah. Masukkan Order ID yang ingin disetujui.\nContoh: .acc MAP-1234", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+		_ = w.SendReplyToGroup(ctx, chatJID, "Format salah. Masukkan Order ID atau reply pesan order dengan 'acc'.\nContoh: reply pesan order dengan 'acc', atau ketik .acc MAP-1234", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
 
@@ -1007,9 +1058,8 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 
 	cancelCh := w.imagemapManager.ApproveOrder(order.PaymentID, qrisResp.Data.TransactionID, qrisResp.Data.TotalAmount)
 
-	// Kirim QRIS dan instruksi pembayaran ke pemesan (disertai tombol Batalkan Pesanan sesuai order-modules.js)
+	// Kirim QRIS dan instruksi pembayaran ke pemesan (pesan gambar biasa)
 	userChatJID, _ := types.ParseJID(order.ChatJID)
-	paymentTitle := "PEMBAYARAN IMAGEMAP"
 	paymentCaption := fmt.Sprintf("Pesanan imagemap Anda telah disetujui oleh admin.\n\n"+
 		"Rincian Pembayaran:\n"+
 		"Nama Map    : %s\n"+
@@ -1025,14 +1075,12 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 		order.MapName, order.Width, order.Height, order.TotalTiles,
 		formatRupiah(qrisResp.Data.TotalAmount), order.PaymentID, qrisResp.Data.ExpiredInMinutes)
 
-	userButtons := []InteractiveButtonDef{
-		{Text: "Batalkan Pesanan", ID: ".cancelmap"},
-	}
-
-	err = w.SendImageButtons(ctx, userChatJID, qrPNG, paymentTitle, paymentCaption, "Scan QRIS di atas untuk membayar", userButtons)
+	qrMsgID, err := w.SendImageReplyWithID(ctx, userChatJID, qrPNG, "image/png", paymentCaption, nil)
 	if err != nil {
-		fmt.Printf("[WA-ImageMap] Gagal kirim gambar QR ke %s (%v), kirim teks fallback...\n", order.ChatJID, err)
+		fmt.Printf("[WA-ImageMap] Gagal kirim gambar QR ke %s (%v), fallback teks...\n", order.ChatJID, err)
 		_ = w.SendToJID(ctx, userChatJID, paymentCaption)
+	} else {
+		order.QRMessageID = qrMsgID
 	}
 
 	// Jalankan background payment watcher
@@ -1044,7 +1092,7 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 	_ = w.SendReplyToGroup(ctx, chatJID, adminConfirm, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 }
 
-// HandleDeclineImageMap menangani penolakan pesanan oleh admin (.decline <orderID> [alasan]).
+// HandleDeclineImageMap menangani penolakan pesanan oleh admin (.decline <orderID> [alasan] atau reply 'reject [alasan]').
 func (w *WAClient) HandleDeclineImageMap(ctx context.Context, evt *events.Message, rawArgs string) {
 	chatJID := evt.Info.Chat
 
@@ -1067,13 +1115,21 @@ func (w *WAClient) HandleDeclineImageMap(ctx context.Context, evt *events.Messag
 		reason = strings.TrimSpace(rawArgs)
 	}
 
-	if orderID == "" {
-		_ = w.SendReplyToGroup(ctx, chatJID, "Format salah. Masukkan Order ID yang ingin ditolak.\nContoh: .decline MAP-1234 [alasan]", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
-		return
+	// Bersihkan reason jika berisi kata command decline/reject/tolak
+	cleanedReason := strings.TrimSpace(reason)
+	for _, prefix := range []string{"reject", "decline", "tolak", ".reject", ".decline", ".tolak"} {
+		if strings.HasPrefix(strings.ToLower(cleanedReason), prefix) {
+			cleanedReason = strings.TrimSpace(cleanedReason[len(prefix):])
+		}
 	}
+	if cleanedReason == "" {
+		cleanedReason = "Gambar tidak memenuhi ketentuan server."
+	}
+	reason = cleanedReason
 
-	if reason == "" {
-		reason = "Gambar tidak memenuhi ketentuan server."
+	if orderID == "" {
+		_ = w.SendReplyToGroup(ctx, chatJID, "Format salah. Masukkan Order ID atau reply pesan order dengan 'reject [alasan]'.\nContoh: reply pesan order dengan 'reject', atau ketik .decline MAP-1234 [alasan]", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
+		return
 	}
 
 	order := w.imagemapManager.GetOrderByPaymentID(orderID)
@@ -1119,6 +1175,10 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 			return
 
 		case <-timeout:
+			// Hapus pesan QR jika masih ada saat kedaluwarsa
+			if order.QRMessageID != "" {
+				_ = w.DeleteMessage(context.Background(), chatJID, order.QRMessageID)
+			}
 			w.imagemapManager.CancelOrder(order.PaymentID, "expired")
 			msg := fmt.Sprintf("Waktu Pembayaran Habis\n\n"+
 				"Pesanan imagemap '%s' (Payment ID: %s) telah kedaluwarsa karena melebihi batas waktu pembayaran.", order.MapName, order.PaymentID)
@@ -1140,6 +1200,11 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 
 			status := strings.ToLower(statusResp.Data.Status)
 			if status == "paid" || status == "success" {
+				// Hapus pesan QR yang dikirimkan ke pemesan karena pembayaran sudah berhasil
+				if order.QRMessageID != "" {
+					_ = w.DeleteMessage(context.Background(), chatJID, order.QRMessageID)
+				}
+
 				uploadDir := w.config.ImageMapUploadDir
 				if uploadDir == "" {
 					uploadDir = "upload/images"
@@ -1183,6 +1248,11 @@ func (w *WAClient) watchImageMapPayment(order *ImageMapOrder, cancelCh chan stru
 				}
 				return
 			} else if status == "cancel" || status == "expired" {
+				// Hapus pesan QR jika dibatalkan atau kedaluwarsa
+				if order.QRMessageID != "" {
+					_ = w.DeleteMessage(context.Background(), chatJID, order.QRMessageID)
+				}
+
 				w.imagemapManager.CancelOrder(order.PaymentID, status)
 				msg := fmt.Sprintf("Pembayaran Dibatalkan / Kedaluwarsa\n\n"+
 					"Pesanan imagemap '%s' (Payment ID: %s) tidak dapat dilanjutkan.", order.MapName, order.PaymentID)
@@ -1202,6 +1272,12 @@ func (w *WAClient) CancelUserPendingOrder(ctx context.Context, evt *events.Messa
 	if order == nil {
 		_ = w.SendReplyToGroup(ctx, chatJID, "Anda tidak memiliki pesanan imagemap yang sedang berjalan.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
+	}
+
+	// Hapus pesan QR jika masih ada
+	if order.QRMessageID != "" {
+		userChatJID, _ := types.ParseJID(order.ChatJID)
+		_ = w.DeleteMessage(ctx, userChatJID, order.QRMessageID)
 	}
 
 	if order.TransactionID != "" && w.casakuClient != nil {
