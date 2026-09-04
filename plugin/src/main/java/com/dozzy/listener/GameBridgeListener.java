@@ -292,7 +292,7 @@ public class GameBridgeListener implements Listener {
     }
 
     /**
-     * 5. Elytra Terbakar Lava / Void / Meledak
+     * 5. Elytra Broken
      */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onItemDamage(EntityDamageEvent event) {
@@ -429,8 +429,8 @@ public class GameBridgeListener implements Listener {
             });
 
             // 3. Kirim Notifikasi Real-Time ke WhatsApp
-            String realTimeMsg = String.format("*%s* mendapatkan elytra ke-*%d*!\nLokasi: *%s* (%d, %d, %d)",
-                    ownerName, newCount, worldName, x, y, z);
+            String realTimeMsg = String.format("*%s* mendapatkan elytra ke- *%d* !",ownerName, newCount);//\nLokasi: *%s* (%d, %d, %d)",ownerName, newCount, worldName, x, y, z);
+                    
             manager.sendNotification("Elytra Obtained", realTimeMsg);
 
             // 4. Kirim Update Leaderboard ke WhatsApp
@@ -529,7 +529,7 @@ public class GameBridgeListener implements Listener {
         // Cooldown 2 menit per player
         if (last == null || now - last > 120_000L) {
             eggCooldowns.put(uuid, now);
-            String message = "*Dragon Egg* telah diambil/disentuh oleh *" + player.getName() + "*!";
+            String message = "*Dragon Egg* telah diambil oleh *" + player.getName() + "* !";
             manager.sendNotification("Dragon Egg Taken", message);
             plugin.getLogger().info("[Game-Bridge] Notifikasi Dragon Egg dikirim untuk " + player.getName());
         }
