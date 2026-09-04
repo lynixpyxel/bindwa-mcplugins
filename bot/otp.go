@@ -19,6 +19,7 @@ var (
 
 type OTPEntry struct {
 	Code      string
+	Username  string
 	ExpiresAt time.Time
 	Attempts  int
 	CreatedAt time.Time
@@ -57,7 +58,7 @@ func generateNumericCode(length int) (string, error) {
 	return code, nil
 }
 
-func (s *OTPStore) Generate(uuid, phone string) (string, error) {
+func (s *OTPStore) Generate(uuid, phone, username string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -78,6 +79,7 @@ func (s *OTPStore) Generate(uuid, phone string) (string, error) {
 
 	s.store[k] = OTPEntry{
 		Code:      code,
+		Username:  username,
 		ExpiresAt: now.Add(s.ttl),
 		Attempts:  0,
 		CreatedAt: now,
@@ -89,6 +91,7 @@ func (s *OTPStore) Generate(uuid, phone string) (string, error) {
 type VerifyResult struct {
 	Success      bool
 	AttemptsLeft int
+	Username     string
 }
 
 func (s *OTPStore) Verify(uuid, phone, inputCode string) (VerifyResult, error) {
@@ -115,15 +118,15 @@ func (s *OTPStore) Verify(uuid, phone, inputCode string) (VerifyResult, error) {
 		entry.Attempts++
 		if entry.Attempts >= s.maxAttempts {
 			delete(s.store, k)
-			return VerifyResult{Success: false, AttemptsLeft: 0}, ErrMaxAttemptsExceeded
+			return VerifyResult{Success: false, AttemptsLeft: 0, Username: entry.Username}, ErrMaxAttemptsExceeded
 		}
 		s.store[k] = entry
-		return VerifyResult{Success: false, AttemptsLeft: s.maxAttempts - entry.Attempts}, ErrWrongOTP
+		return VerifyResult{Success: false, AttemptsLeft: s.maxAttempts - entry.Attempts, Username: entry.Username}, ErrWrongOTP
 	}
 
 	// Sukses verifikasi -> hapus dari store (one-time use)
 	delete(s.store, k)
-	return VerifyResult{Success: true, AttemptsLeft: s.maxAttempts - entry.Attempts}, nil
+	return VerifyResult{Success: true, AttemptsLeft: s.maxAttempts - entry.Attempts, Username: entry.Username}, nil
 }
 
 func (s *OTPStore) StartCleanup(ctx context.Context, interval time.Duration) {

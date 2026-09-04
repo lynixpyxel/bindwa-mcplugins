@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -77,6 +77,8 @@ type WAClient struct {
 	participantMu     sync.RWMutex
 	latestLeaderboard []LeaderboardEntry
 	leaderboardMu     sync.RWMutex
+	imagemapManager   *ImageMapOrderManager
+	casakuClient      *CasakuClient
 }
 
 func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath string) (*WAClient, error) {
@@ -94,16 +96,25 @@ func NewWAClient(ctx context.Context, dbPath string, cfg Config, configPath stri
 
 	client := whatsmeow.NewClient(deviceStore, log)
 
+	uploadDir := cfg.ImageMapUploadDir
+	if uploadDir == "" {
+		uploadDir = "upload/images"
+	}
+	imManager := NewImageMapOrderManager(uploadDir, "upload/imagemap_transactions.json")
+	casaku := NewCasakuClient(cfg.CasakuBaseURL, cfg.CasakuLicenseKey, cfg.CasakuQRID)
+
 	w := &WAClient{
-		client:         client,
-		container:      container,
-		config:         cfg,
-		configPath:     configPath,
-		groupNames:     make(map[string]cachedGroup),
-		rulesManager:   NewRulesManager("group_rules.json"),
-		warnManager:    NewWarnManager("group_warns.json"),
-		welcomeManager: NewWelcomeManager("group_welcome.json"),
-		participantMap: make(map[string]string),
+		client:          client,
+		container:       container,
+		config:          cfg,
+		configPath:      configPath,
+		groupNames:      make(map[string]cachedGroup),
+		rulesManager:    NewRulesManager("group_rules.json"),
+		warnManager:     NewWarnManager("group_warns.json"),
+		welcomeManager:  NewWelcomeManager("group_welcome.json"),
+		participantMap:  make(map[string]string),
+		imagemapManager: imManager,
+		casakuClient:    casaku,
 	}
 
 	client.AddEventHandler(w.eventHandler)
@@ -444,6 +455,24 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 		text = msg
 	} else if ext := evt.Message.GetExtendedTextMessage(); ext != nil && ext.GetText() != "" {
 		text = ext.GetText()
+	} else if img := evt.Message.GetImageMessage(); img != nil && img.GetCaption() != "" {
+		text = img.GetCaption()
+	} else if doc := evt.Message.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
+		text = doc.GetCaption()
+	} else if btnResp := evt.Message.GetButtonsResponseMessage(); btnResp != nil {
+		text = btnResp.GetSelectedButtonID()
+	} else if tmplResp := evt.Message.GetTemplateButtonReplyMessage(); tmplResp != nil {
+		text = tmplResp.GetSelectedID()
+	} else if interResp := evt.Message.GetInteractiveResponseMessage(); interResp != nil && interResp.GetNativeFlowResponseMessage() != nil {
+		paramsJSON := interResp.GetNativeFlowResponseMessage().GetParamsJSON()
+		var parsed struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(paramsJSON), &parsed); err == nil && parsed.ID != "" {
+			text = parsed.ID
+		} else {
+			text = paramsJSON
+		}
 	}
 
 	text = strings.TrimSpace(text)
@@ -473,6 +502,21 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 	ctx := context.Background()
 
 	switch cmd {
+	case "help", "menu":
+		w.replyMenu(evt.Info.Chat, evt)
+
+	case "imagemap", "ordermap", "buymap", "orderimg":
+		go w.ProcessImageMapOrder(ctx, evt, args)
+
+	case "cancelmap", "cancelorder":
+		go w.CancelUserPendingOrder(ctx, evt)
+
+	case "acc", "approve":
+		go w.HandleApproveImageMap(ctx, evt, args)
+
+	case "decline", "reject":
+		go w.HandleDeclineImageMap(ctx, evt, args)
+
 	case "mccmdlist", "mccmd", "cmdlist", "mccommands", "commandlist":
 		msg := "*MINECRAFT SERVER COMMAND LIST*\n" +
 			"━━━━━━━━━━━━━━━━━━━━━\n\n" +
@@ -526,6 +570,12 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 
 	case "top", "leaderboard", "elytratop", "elytraboard":
 		go w.replyLeaderboard(evt.Info.Chat, evt)
+
+	case "dino", "dinorunner":
+		go func() {
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "🦖")
+			_ = w.SendDinoGame(evt.Info.Chat, evt)
+		}()
 
 	case "rules", "rule", "peraturan":
 		groupName := w.GetGroupName(evt.Info.Chat)
@@ -750,6 +800,37 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 			return
 		}
 
+		groupName := w.GetGroupName(evt.Info.Chat)
+
+		// Cek apakah mode link khusus logs
+		if strings.EqualFold(args, "logs") || strings.EqualFold(args, "log") {
+			alreadyLinked := false
+			for _, j := range w.config.LogGroupJIDs {
+				if strings.EqualFold(strings.TrimSpace(j), chatJID) {
+					alreadyLinked = true
+					break
+				}
+			}
+			if !alreadyLinked {
+				w.config.LogGroupJIDs = append(w.config.LogGroupJIDs, chatJID)
+				if w.configPath != "" {
+					_ = SaveConfig(w.configPath, w.config)
+				}
+			}
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+			replyMsg := fmt.Sprintf("*Grup Berhasil Dihubungkan sebagai Grup Logs!*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"• Nama Grup: *%s*\n"+
+				"• JID: `%s`\n"+
+				"• Tipe: *Logs & Audit (Verifikasi OTP, Akun)*\n"+
+				"━━━━━━━━━━━━━━━━━━━━━\n"+
+				"_Notifikasi audit verifikasi akun/OTP pemain akan dikirimkan khusus ke grup ini._",
+				groupName, chatJID)
+			_ = w.SendToJID(ctx, evt.Info.Chat, replyMsg)
+			fmt.Printf("[WA-Admin] Log group linked by %s: %s (%s)\n", senderPhone, groupName, chatJID)
+			return
+		}
+
 		alreadyLinked := false
 		for _, j := range w.config.GroupJIDs {
 			if strings.EqualFold(strings.TrimSpace(j), chatJID) {
@@ -757,8 +838,6 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 				break
 			}
 		}
-
-		groupName := w.GetGroupName(evt.Info.Chat)
 
 		if !alreadyLinked {
 			w.config.GroupJIDs = append(w.config.GroupJIDs, chatJID)
@@ -774,8 +853,9 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 			"• JID: `%s`\n"+
 			"• Status: *Aktif & Tersimpan*\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
-			"_Anggota grup ini sekarang dapat menggunakan perintah %schat <pesan>, %scekserver, %srules, dan %swarn._",
-			groupName, chatJID, prefix, prefix, prefix, prefix)
+			"_Anggota grup ini sekarang dapat menggunakan perintah %schat <pesan>, %scekserver, %srules, dan %swarn._\n\n"+
+			"_Tip: Gunakan `%slinkgroup logs` jika ingin menghubungkan grup khusus log verifikasi OTP._",
+			groupName, chatJID, prefix, prefix, prefix, prefix, prefix)
 		_ = w.SendToJID(ctx, evt.Info.Chat, replyMsg)
 		fmt.Printf("[WA-Admin] Group linked by owner %s: %s (%s)\n", senderPhone, groupName, chatJID)
 
@@ -791,6 +871,25 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 			return
 		}
 
+		groupName := w.GetGroupName(evt.Info.Chat)
+
+		// Cek jika unlink khusus logs
+		if strings.EqualFold(args, "logs") || strings.EqualFold(args, "log") {
+			newLogs := make([]string, 0, len(w.config.LogGroupJIDs))
+			for _, j := range w.config.LogGroupJIDs {
+				if !strings.EqualFold(strings.TrimSpace(j), chatJID) {
+					newLogs = append(newLogs, j)
+				}
+			}
+			w.config.LogGroupJIDs = newLogs
+			if w.configPath != "" {
+				_ = SaveConfig(w.configPath, w.config)
+			}
+			_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
+			_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("Grup *%s* telah diputuskan dari grup logs Minecraft.", groupName))
+			return
+		}
+
 		newGroups := make([]string, 0, len(w.config.GroupJIDs))
 		for _, j := range w.config.GroupJIDs {
 			if !strings.EqualFold(strings.TrimSpace(j), chatJID) {
@@ -802,7 +901,6 @@ func (w *WAClient) handleIncomingMessage(evt *events.Message) {
 			_ = SaveConfig(w.configPath, w.config)
 		}
 
-		groupName := w.GetGroupName(evt.Info.Chat)
 		_ = w.ReactMessage(evt.Info.Chat, evt.Info.Sender, evt.Info.ID, "✅")
 		_ = w.SendToJID(ctx, evt.Info.Chat, fmt.Sprintf("Grup *%s* telah diputuskan hubungannya dari server Minecraft.", groupName))
 
@@ -1187,36 +1285,57 @@ func (w *WAClient) UpdateLeaderboardFromText(text string) {
 	w.leaderboardMu.Unlock()
 }
 
+func (w *WAClient) formatLeaderboardText(entries []LeaderboardEntry, isUpdate bool) string {
+	title := "*ELYTRA LEADERBOARD*"
+	if isUpdate {
+		title = "*ELYTRA LEADERBOARD UPDATE*"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(title + "\n━━━━━━━━━━━━━━━━━━━━━\n")
+
+	if len(entries) == 0 {
+		sb.WriteString("No data available.\n")
+	} else {
+		for _, e := range entries {
+			rankStr := strings.TrimPrefix(e.Rank, "#")
+			sb.WriteString(fmt.Sprintf("%s. %s — %s elytra\n", rankStr, e.Player, e.Count))
+		}
+	}
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━")
+	return sb.String()
+}
+
 func (w *WAClient) replyLeaderboard(target types.JID, replyTo *events.Message) {
 	w.leaderboardMu.RLock()
 	entries := make([]LeaderboardEntry, len(w.latestLeaderboard))
 	copy(entries, w.latestLeaderboard)
 	w.leaderboardMu.RUnlock()
 
-	headers := []string{"Rank", "Player", "Elytra Count"}
-	var rows [][]string
+	text := w.formatLeaderboardText(entries, false)
 
-	if len(entries) == 0 {
-		rows = append(rows, []string{"-", "No data", "-"})
-	} else {
-		for _, e := range entries {
-			rows = append(rows, []string{e.Rank, e.Player, e.Count})
-		}
+	replyToID := ""
+	replySender := ""
+	if replyTo != nil {
+		replyToID = string(replyTo.Info.ID)
+		replySender = replyTo.Info.Sender.ToNonAD().String()
 	}
 
-	submessages := []*waAICommonDeprecated.AIRichResponseSubMessage{
-		NewRichTextSubMessage("# Elytra Leaderboard"),
-		NewRichTableSubMessage("Elytra Leaderboard", headers, rows),
-	}
+	_ = w.SendReplyToGroup(context.Background(), target, text, replyToID, replySender, "")
+}
 
-	if w.client != nil {
-		if err := SendRichMessage(w.client, target, submessages, replyTo); err != nil {
-			fmt.Printf("[WAClient] replyLeaderboard SendRichMessage error: %v\n", err)
-		}
+func (w *WAClient) SendDinoGame(target types.JID, replyTo *events.Message) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
 	}
+	return SendDinoGame(w.client, target, replyTo)
 }
 
 func (w *WAClient) BroadcastRichLeaderboard(ctx context.Context) int {
+	return w.BroadcastLeaderboard(ctx)
+}
+
+func (w *WAClient) BroadcastLeaderboard(ctx context.Context) int {
 	if !w.IsReady() {
 		return 0
 	}
@@ -1226,35 +1345,45 @@ func (w *WAClient) BroadcastRichLeaderboard(ctx context.Context) int {
 	copy(entries, w.latestLeaderboard)
 	w.leaderboardMu.RUnlock()
 
-	headers := []string{"Rank", "Player", "Elytra Count"}
-	var rows [][]string
-	for _, e := range entries {
-		rows = append(rows, []string{e.Rank, e.Player, e.Count})
+	text := w.formatLeaderboardText(entries, true)
+	return w.SendToGroups(ctx, text)
+}
+
+func (w *WAClient) SendToLogGroups(ctx context.Context, message string) int {
+	if !w.IsReady() {
+		return 0
 	}
 
-	submessages := []*waAICommonDeprecated.AIRichResponseSubMessage{
-		NewRichTextSubMessage("# Elytra Leaderboard Update"),
-		NewRichTableSubMessage("Elytra Leaderboard", headers, rows),
+	w.mu.RLock()
+	logGroups := make([]string, len(w.config.LogGroupJIDs))
+	copy(logGroups, w.config.LogGroupJIDs)
+	w.mu.RUnlock()
+
+	if len(logGroups) == 0 {
+		return 0
 	}
 
 	successCount := 0
-	for _, rawJid := range w.config.GroupJIDs {
+	for _, rawJid := range logGroups {
 		cleanJid := strings.TrimSpace(rawJid)
 		if cleanJid == "" {
 			continue
 		}
-		var gJID types.JID
+
+		var jid types.JID
 		if strings.Contains(cleanJid, "@") {
-			gJID, _ = types.ParseJID(cleanJid)
+			jid, _ = types.ParseJID(cleanJid)
 		} else {
-			gJID = types.NewJID(cleanJid, types.GroupServer)
+			jid = types.NewJID(cleanJid, types.GroupServer)
 		}
 
-		err := SendRichMessage(w.client, gJID, submessages, nil)
-		if err == nil {
+		if err := w.SendToJID(ctx, jid, message); err == nil {
 			successCount++
+		} else {
+			fmt.Printf("[WA-Client] Gagal kirim ke grup logs %s: %v\n", cleanJid, err)
 		}
 	}
+
 	return successCount
 }
 
@@ -1380,6 +1509,100 @@ func (w *WAClient) SendImageWithMentions(ctx context.Context, jid types.JID, ima
 		ImageMessage: imageMsg,
 	})
 	return err
+}
+
+func (w *WAClient) SendImageReply(ctx context.Context, jid types.JID, imageBytes []byte, mimeType string, caption string, replyEvt *events.Message) error {
+	if !w.IsReady() {
+		return ErrWANotConnected
+	}
+
+	uploadResp, err := w.client.Upload(ctx, imageBytes, whatsmeow.MediaImage)
+	if err != nil {
+		return fmt.Errorf("failed to upload image: %w", err)
+	}
+
+	if mimeType == "" {
+		mimeType = "image/png"
+	}
+
+	var ctxInfo *waProto.ContextInfo
+	if replyEvt != nil {
+		ctxInfo = &waProto.ContextInfo{
+			StanzaID: proto.String(string(replyEvt.Info.ID)),
+		}
+		sender := replyEvt.Info.Sender.ToNonAD().String()
+		if sender != "" {
+			ctxInfo.Participant = proto.String(sender)
+		}
+	}
+
+	imageMsg := &waProto.ImageMessage{
+		Caption:       proto.String(caption),
+		Mimetype:      proto.String(mimeType),
+		URL:           &uploadResp.URL,
+		DirectPath:    &uploadResp.DirectPath,
+		MediaKey:      uploadResp.MediaKey,
+		FileEncSHA256: uploadResp.FileEncSHA256,
+		FileSHA256:    uploadResp.FileSHA256,
+		FileLength:    &uploadResp.FileLength,
+		ContextInfo:   ctxInfo,
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	_, err = w.client.SendMessage(sendCtx, jid, &waProto.Message{
+		ImageMessage: imageMsg,
+	})
+	return err
+}
+
+func (w *WAClient) replyMenu(chatJID types.JID, evt *events.Message) {
+	serverName := w.config.ServerName
+	if serverName == "" {
+		serverName = "CSMP Minecraft Server"
+	}
+
+	menu := fmt.Sprintf("*MENU BOT MINECRAFT*\n"+
+		"━━━━━━━━━━━━━━━━━━━━━\n"+
+		"Server: *%s*\n"+
+		"Prefix: `.` `!` `#` `?`\n"+
+		"━━━━━━━━━━━━━━━━━━━━━\n\n"+
+		"🎮 *MINECRAFT & SERVER*\n"+
+		"• *.status* / *.cekserver* : Cek status server & pemain online\n"+
+		"• *.top* / *.elytratop* : Leaderboard perolehan elytra\n"+
+		"• *.chat <pesan>* : Kirim chat ke dalam game Minecraft\n"+
+		"• *.mccmdlist* : Daftar perintah command in-game Minecraft\n\n"+
+		"🖼️ *IMAGE MAP (CUSTOM PICTURE)*\n"+
+		"• *.imagemap <nama> <tinggi> <lebar>*\n"+
+		"  _Beli custom map dengan reply atau caption foto._\n"+
+		"  Contoh: `.imagemap logo 2 2`\n"+
+		"• *.imagemap <nama> <lebar>x<tinggi>*\n"+
+		"  _Format cross lebih ringkas._\n"+
+		"  Contoh: `.imagemap logo 2x2`\n"+
+		"• *.imagemap <url> <nama> <lebar>x<tinggi>*\n"+
+		"  _Pesan map langsung menggunakan URL link gambar._\n"+
+		"• *.cancelmap* : Batalkan order imagemap yang aktif\n"+
+		"• *.acc <order_id>* : Setujui pesanan imagemap (Admin)\n"+
+		"• *.decline <order_id> [alasan]* : Tolak pesanan imagemap (Admin)\n\n"+
+		"🛡️ *PENGATURAN GRUP*\n"+
+		"• *.rules* : Lihat peraturan grup\n"+
+		"• *.setrules <teks>* : Ubah peraturan grup (Admin)\n"+
+		"• *.warn @user [alasan]* : Beri peringatan member (Admin)\n"+
+		"• *.cekwarn* : Cek sisa peringatan akun kamu\n"+
+		"• *.resetwarn @user* : Reset peringatan member (Admin)\n"+
+		"• *.setwelcome <teks>* : Atur template welcome (Admin)\n"+
+		"• *.setgoodbye <teks>* : Atur template goodbye (Admin)\n"+
+		"• *.cekwelcome* : Cek template sambutan grup\n"+
+		"• *.linkgroup [logs]* : Hubungkan grup ini ke server (Owner)\n"+
+		"• *.unlinkgroup [logs]* : Putus tautan grup (Owner)\n\n"+
+		"🎲 *HIBURAN*\n"+
+		"• *.dino* : Mainkan game Dino Runner di WhatsApp\n\n"+
+		"━━━━━━━━━━━━━━━━━━━━━\n"+
+		"_Ketik perintah di atas untuk menggunakan fitur._", serverName)
+
+	_ = w.ReactMessage(chatJID, evt.Info.Sender, evt.Info.ID, "📖")
+	_ = w.SendReplyToGroup(context.Background(), chatJID, menu, string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 }
 
 func (w *WAClient) fetchUserProfilePicture(ctx context.Context, jid types.JID) []byte {

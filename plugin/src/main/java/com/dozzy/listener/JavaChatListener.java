@@ -131,7 +131,7 @@ public class JavaChatListener implements Listener {
             databaseManager.saveOrUpdatePendingBinding(uuid, normalized);
             databaseManager.logAction(uuid, normalized, "send_otp");
 
-            apiClient.sendOtp(uuid, normalized).thenAccept(result -> {
+            apiClient.sendOtp(uuid, player.getName(), normalized).thenAccept(result -> {
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (!player.isOnline()) {
                         return;
@@ -175,7 +175,7 @@ public class JavaChatListener implements Listener {
         String otpInput = rawMessage.replaceAll("\\s+", "");
 
         // Panggil verify-otp ke bot secara async
-        apiClient.verifyOtp(uuid, phone, otpInput).thenAccept(result -> {
+        apiClient.verifyOtp(uuid, player.getName(), phone, otpInput).thenAccept(result -> {
             Bukkit.getScheduler().runTask(plugin, () -> {
                 if (!player.isOnline()) {
                     return;

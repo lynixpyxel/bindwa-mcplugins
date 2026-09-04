@@ -137,7 +137,7 @@ public class JavaAnvilListener implements Listener {
                 databaseManager.saveOrUpdatePendingBinding(uuid, normalized);
                 databaseManager.logAction(uuid, normalized, "send_otp");
 
-                apiClient.sendOtp(uuid, normalized).thenAccept(result -> {
+                apiClient.sendOtp(uuid, player.getName(), normalized).thenAccept(result -> {
                     Bukkit.getScheduler().runTask(plugin, () -> {
                         if (!player.isOnline()) {
                             return;

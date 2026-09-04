@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"go.mau.fi/whatsmeow/proto/waAICommon"
 	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
@@ -174,5 +175,105 @@ func TestSendRichMessageMultiSubmessagesAndFallback(t *testing.T) {
 	}
 	if !strings.Contains(fallback, "> _Powered by Baileys_") {
 		t.Errorf("Expected fallback to contain footer, got:\n%s", fallback)
+	}
+}
+
+func TestBuildDinoMessage(t *testing.T) {
+	msg := BuildDinoMessage(nil)
+	if msg == nil {
+		t.Fatalf("BuildDinoMessage returned nil")
+	}
+
+	// 1. Verify MessageContextInfo
+	ctxInfo := msg.GetMessageContextInfo()
+	if ctxInfo == nil {
+		t.Fatalf("Expected MessageContextInfo to not be nil")
+	}
+	if ctxInfo.GetDeviceListMetadataVersion() != 2 {
+		t.Errorf("Expected DeviceListMetadataVersion 2, got %d", ctxInfo.GetDeviceListMetadataVersion())
+	}
+	if ctxInfo.GetDeviceListMetadata() == nil {
+		t.Errorf("Expected DeviceListMetadata to not be nil")
+	}
+
+	botMeta := ctxInfo.GetBotMetadata()
+	if botMeta == nil {
+		t.Fatalf("Expected BotMetadata to not be nil")
+	}
+	if botMeta.GetBotResponseID() != "b2e40280-433c-45d8-9c1a-270bec558860" {
+		t.Errorf("Unexpected BotResponseID: %s", botMeta.GetBotResponseID())
+	}
+
+	// 2. Verify Verification Metadata & Proofs
+	verifMeta := botMeta.GetVerificationMetadata()
+	if verifMeta == nil {
+		t.Fatalf("Expected VerificationMetadata to not be nil")
+	}
+	proofs := verifMeta.GetProofs()
+	if len(proofs) != 1 {
+		t.Fatalf("Expected 1 proof, got %d", len(proofs))
+	}
+	p := proofs[0]
+	if p.GetVersion() != 1 {
+		t.Errorf("Expected proof version 1, got %d", p.GetVersion())
+	}
+	if p.GetUseCase() != waAICommon.BotSignatureVerificationUseCaseProof_WA_BOT_MSG {
+		t.Errorf("Expected proof useCase WA_BOT_MSG, got %v", p.GetUseCase())
+	}
+	if len(p.GetSignature()) != 64 {
+		t.Errorf("Expected signature length 64 bytes, got %d", len(p.GetSignature()))
+	}
+	if len(p.GetCertificateChain()) != 2 {
+		t.Errorf("Expected 2 certificates in chain, got %d", len(p.GetCertificateChain()))
+	}
+
+	// 3. Verify BotForwardedMessage & RichResponseMessage
+	bfm := msg.GetBotForwardedMessage()
+	if bfm == nil || bfm.GetMessage() == nil {
+		t.Fatalf("Expected BotForwardedMessage.Message to not be nil")
+	}
+	richMsg := bfm.GetMessage().GetRichResponseMessage()
+	if richMsg == nil {
+		t.Fatalf("Expected RichResponseMessage to not be nil")
+	}
+	if richMsg.GetMessageType() != waAICommonDeprecated.AIRichResponseMessageType_AI_RICH_RESPONSE_TYPE_STANDARD {
+		t.Errorf("Expected message type AI_RICH_RESPONSE_TYPE_STANDARD, got %v", richMsg.GetMessageType())
+	}
+	if len(richMsg.GetSubmessages()) != 1 {
+		t.Fatalf("Expected 1 submessage, got %d", len(richMsg.GetSubmessages()))
+	}
+	if richMsg.GetSubmessages()[0].GetMessageText() != "Fiora Sylvie" {
+		t.Errorf("Unexpected submessage text: %s", richMsg.GetSubmessages()[0].GetMessageText())
+	}
+
+	// 4. Verify UnifiedResponse HTML Primitive
+	unified := richMsg.GetUnifiedResponse()
+	if unified == nil || len(unified.GetData()) == 0 {
+		t.Fatalf("Expected UnifiedResponse Data to not be empty")
+	}
+	dataStr := string(unified.GetData())
+	if !strings.Contains(dataStr, "GenAIaeacdsnwHtmlPrimitive") {
+		t.Errorf("Expected UnifiedResponse Data to contain GenAIaeacdsnwHtmlPrimitive")
+	}
+	if !strings.Contains(dataStr, "Dino Runner") {
+		t.Errorf("Expected UnifiedResponse Data to contain Dino Runner")
+	}
+	if !strings.Contains(dataStr, "trusted_sources") {
+		t.Errorf("Expected UnifiedResponse Data to contain trusted_sources")
+	}
+
+	// 5. Verify ContextInfo
+	rcCtx := richMsg.GetContextInfo()
+	if rcCtx == nil {
+		t.Fatalf("Expected ContextInfo on RichResponseMessage to not be nil")
+	}
+	if !rcCtx.GetIsForwarded() {
+		t.Errorf("Expected IsForwarded = true")
+	}
+	if rcCtx.GetForwardOrigin() != waProto.ContextInfo_META_AI {
+		t.Errorf("Expected ForwardOrigin META_AI, got %v", rcCtx.GetForwardOrigin())
+	}
+	if rcCtx.GetForwardedAiBotMessageInfo().GetBotJID() != "867051314767696@bot" {
+		t.Errorf("Unexpected BotJID: %s", rcCtx.GetForwardedAiBotMessageInfo().GetBotJID())
 	}
 }

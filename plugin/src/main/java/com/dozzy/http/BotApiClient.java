@@ -32,8 +32,13 @@ public class BotApiClient {
     }
 
     public CompletableFuture<SendOtpResult> sendOtp(UUID uuid, String phone) {
+        return sendOtp(uuid, "Player", phone);
+    }
+
+    public CompletableFuture<SendOtpResult> sendOtp(UUID uuid, String username, String phone) {
         String url = trimTrailingSlash(config.getApiBaseUrl()) + "/send-otp";
-        String jsonBody = String.format("{\"uuid\":\"%s\",\"phone\":\"%s\"}", uuid.toString(), escapeJson(phone));
+        String jsonBody = String.format("{\"uuid\":\"%s\",\"username\":\"%s\",\"phone\":\"%s\"}",
+                uuid.toString(), escapeJson(username), escapeJson(phone));
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -68,9 +73,13 @@ public class BotApiClient {
     }
 
     public CompletableFuture<VerifyOtpResult> verifyOtp(UUID uuid, String phone, String otp) {
+        return verifyOtp(uuid, "Player", phone, otp);
+    }
+
+    public CompletableFuture<VerifyOtpResult> verifyOtp(UUID uuid, String username, String phone, String otp) {
         String url = trimTrailingSlash(config.getApiBaseUrl()) + "/verify-otp";
-        String jsonBody = String.format("{\"uuid\":\"%s\",\"phone\":\"%s\",\"otp\":\"%s\"}",
-                uuid.toString(), escapeJson(phone), escapeJson(otp));
+        String jsonBody = String.format("{\"uuid\":\"%s\",\"username\":\"%s\",\"phone\":\"%s\",\"otp\":\"%s\"}",
+                uuid.toString(), escapeJson(username), escapeJson(phone), escapeJson(otp));
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))

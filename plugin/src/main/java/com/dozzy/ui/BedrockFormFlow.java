@@ -80,7 +80,7 @@ public class BedrockFormFlow {
                 db.saveOrUpdatePendingBinding(uuid, normalized);
                 db.logAction(uuid, normalized, "send_otp");
 
-                apiClient.sendOtp(uuid, normalized).thenAccept(result -> {
+                apiClient.sendOtp(uuid, player.getName(), normalized).thenAccept(result -> {
                     Bukkit.getScheduler().runTask(plugin, () -> {
                         if (!player.isOnline()) {
                             return;
@@ -139,7 +139,7 @@ public class BedrockFormFlow {
             String cleanOtp = otpInput.trim().replaceAll("\\s+", "");
 
             // Panggil verify-otp ke bot secara async
-            apiClient.verifyOtp(uuid, phone, cleanOtp).thenAccept(result -> {
+            apiClient.verifyOtp(uuid, player.getName(), phone, cleanOtp).thenAccept(result -> {
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (!player.isOnline()) {
                         return;

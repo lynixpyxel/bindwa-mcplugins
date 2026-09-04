@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -29,8 +28,10 @@ type Server struct {
 }
 
 type SendOTPRequest struct {
-	UUID  string `json:"uuid"`
-	Phone string `json:"phone"`
+	UUID     string `json:"uuid"`
+	Phone    string `json:"phone"`
+	Username string `json:"username,omitempty"`
+	Player   string `json:"player,omitempty"`
 }
 
 type VerifyOTPRequest struct {
@@ -170,7 +171,12 @@ func (s *Server) handleSendOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code, err := s.otpStore.Generate(req.UUID, req.Phone)
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		username = strings.TrimSpace(req.Player)
+	}
+
+	code, err := s.otpStore.Generate(req.UUID, req.Phone, username)
 	if err != nil {
 		if errors.Is(err, ErrCooldown) {
 			s.writeJSON(w, http.StatusTooManyRequests, APIResponse{Status: "error", Message: "cooldown_active"})
@@ -256,11 +262,14 @@ func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 			username = req.Player
 		}
 		if username == "" {
+			username = res.Username
+		}
+		if username == "" {
 			username = "Player"
 		}
 		bindTime := time.Now().Format("02 Jan 2006 15:04:05 WIB")
 
-		msg := fmt.Sprintf("✅ *VERIFIKASI BERHASIL*\n"+
+		msg := fmt.Sprintf("*VERIFIKASI BERHASIL*\n"+
 			"━━━━━━━━━━━━━━━━━━━━━\n"+
 			"• Username MC: *%s*\n"+
 			"• UUID: `%s`\n"+
@@ -271,6 +280,18 @@ func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 			username, req.UUID, req.Phone, bindTime)
 
 		_ = s.waClient.SendToJID(r.Context(), userJID, msg)
+
+		// Kirim log audit ke grup logs jika ada yang di-link (.linkgroup logs)
+		logMsg := fmt.Sprintf("*[LOG] VERIFIKASI AKUN*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━\n"+
+			"• Player: *%s*\n"+
+			"• UUID: `%s`\n"+
+			"• Nomor WA: *%s*\n"+
+			"• Waktu: *%s*\n"+
+			"• Status: *Berhasil Terhubung*\n"+
+			"━━━━━━━━━━━━━━━━━━━━━",
+			username, req.UUID, req.Phone, bindTime)
+		s.waClient.SendToLogGroups(r.Context(), logMsg)
 	}
 
 	s.writeJSON(w, http.StatusOK, APIResponse{Status: "verified"})
