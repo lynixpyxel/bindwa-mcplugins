@@ -1312,7 +1312,7 @@ func (w *WAClient) ProcessImageMapOrder(ctx context.Context, evt *events.Message
 func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Message, rawArgs string) {
 	chatJID := evt.Info.Chat
 
-	if !w.isSenderOwner(evt) && !w.IsUserGroupAdmin(ctx, chatJID, evt) {
+	if !w.IsOrderModerator(ctx, chatJID, evt) {
 		_ = w.SendReplyToGroup(ctx, chatJID, "Perintah ini hanya dapat dijalankan oleh admin atau pemilik bot.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}
@@ -1451,7 +1451,7 @@ func (w *WAClient) HandleApproveImageMap(ctx context.Context, evt *events.Messag
 func (w *WAClient) HandleDeclineImageMap(ctx context.Context, evt *events.Message, rawArgs string) {
 	chatJID := evt.Info.Chat
 
-	if !w.isSenderOwner(evt) && !w.IsUserGroupAdmin(ctx, chatJID, evt) {
+	if !w.IsOrderModerator(ctx, chatJID, evt) {
 		_ = w.SendReplyToGroup(ctx, chatJID, "Perintah ini hanya dapat dijalankan oleh admin atau pemilik bot.", string(evt.Info.ID), evt.Info.Sender.ToNonAD().String(), "")
 		return
 	}

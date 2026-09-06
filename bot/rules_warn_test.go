@@ -115,12 +115,13 @@ func TestPhoneMatchingAndMentions(t *testing.T) {
 }
 
 func TestIsUserGroupAdminMultiDeviceAndLID(t *testing.T) {
-	groupJID := types.NewJID("120363040000000000", types.GroupServer)
+	groupJIDA := types.NewJID("120363040000000000", types.GroupServer)
+	groupJIDB := types.NewJID("120363099999999999", types.GroupServer)
 	adminPhone := "6285294959195"
 	adminLID := "109876543210"
 
-	groupInfo := &types.GroupInfo{
-		JID: groupJID,
+	groupInfoA := &types.GroupInfo{
+		JID: groupJIDA,
 		Participants: []types.GroupParticipant{
 			{
 				JID:         types.NewJID(adminPhone, types.DefaultUserServer),
@@ -136,15 +137,38 @@ func TestIsUserGroupAdminMultiDeviceAndLID(t *testing.T) {
 		},
 	}
 
+	// Group B: adminPhone is NOT admin in Group B (only a regular member)
+	groupInfoB := &types.GroupInfo{
+		JID: groupJIDB,
+		Participants: []types.GroupParticipant{
+			{
+				JID:         types.NewJID(adminPhone, types.DefaultUserServer),
+				LID:         types.NewJID(adminLID, types.HiddenUserServer),
+				PhoneNumber: types.NewJID(adminPhone, types.DefaultUserServer),
+				IsAdmin:     false,
+			},
+			{
+				JID:         types.NewJID("6287777777777", types.DefaultUserServer),
+				PhoneNumber: types.NewJID("6287777777777", types.DefaultUserServer),
+				IsAdmin:     true,
+			},
+		},
+	}
+
 	w := &WAClient{
 		config: Config{
 			OwnerNumber: "6289999999999",
-			GroupJIDs:   []string{groupJID.String()},
+			GroupJIDs:   []string{groupJIDA.String()},
 		},
 		groupNames: map[string]cachedGroup{
-			groupJID.String(): {
-				name:      "Test Group",
-				info:      groupInfo,
+			groupJIDA.String(): {
+				name:      "Group A",
+				info:      groupInfoA,
+				updatedAt: time.Now(),
+			},
+			groupJIDB.String(): {
+				name:      "Group B",
+				info:      groupInfoB,
 				updatedAt: time.Now(),
 			},
 		},
@@ -157,8 +181,8 @@ func TestIsUserGroupAdminMultiDeviceAndLID(t *testing.T) {
 		Device: 12,
 		Server: types.DefaultUserServer,
 	}
-	if !w.IsUserGroupAdmin(context.Background(), groupJID, evtMD) {
-		t.Errorf("Expected multi-device admin to be recognized as admin")
+	if !w.IsUserGroupAdmin(context.Background(), groupJIDA, evtMD) {
+		t.Errorf("Expected multi-device admin to be recognized as admin in Group A")
 	}
 
 	// Case 2: Sender uses LID with Device ID (e.g. 109876543210:2@lid)
@@ -168,28 +192,43 @@ func TestIsUserGroupAdminMultiDeviceAndLID(t *testing.T) {
 		Device: 2,
 		Server: types.HiddenUserServer,
 	}
-	if !w.IsUserGroupAdmin(context.Background(), groupJID, evtLID) {
-		t.Errorf("Expected LID sender to be recognized as admin")
+	if !w.IsUserGroupAdmin(context.Background(), groupJIDA, evtLID) {
+		t.Errorf("Expected LID sender to be recognized as admin in Group A")
 	}
 
-	// Case 3: Admin executing command in Private Chat (DM with bot)
+	// Case 3: Admin of Group A trying to run admin commands (like linkgroup/unlinkgroup) in Group B -> MUST BE REJECTED!
+	if w.IsUserGroupAdmin(context.Background(), groupJIDB, evtMD) {
+		t.Errorf("Security flaw: User A is admin in Group A, but must NOT be recognized as admin in Group B!")
+	}
+
+	// Case 4: Admin of Group A in DM with bot cannot be group admin (since DM is not a group)
 	dmJID := types.NewJID(adminPhone, types.DefaultUserServer)
-	if !w.IsUserGroupAdmin(context.Background(), dmJID, evtMD) {
-		t.Errorf("Expected group admin executing in DM to be recognized across configured groups")
+	if w.IsUserGroupAdmin(context.Background(), dmJID, evtMD) {
+		t.Errorf("Expected IsUserGroupAdmin to return false for DM chat")
 	}
 
-	// Case 4: Non-admin member should not be admin
+	// Case 5: Admin of Group A CAN moderate orders in DM with bot
+	if !w.IsOrderModerator(context.Background(), dmJID, evtMD) {
+		t.Errorf("Expected configured group admin to be allowed to moderate orders in DM")
+	}
+
+	// Case 6: Admin of Group A CANNOT moderate orders in Group B (where they are not admin)
+	if w.IsOrderModerator(context.Background(), groupJIDB, evtMD) {
+		t.Errorf("Expected user to NOT be order moderator in Group B where they are regular member")
+	}
+
+	// Case 7: Non-admin member should not be admin in Group A
 	evtNonAdmin := &events.Message{}
 	evtNonAdmin.Info.Sender = types.NewJID("6281234567890", types.DefaultUserServer)
-	if w.IsUserGroupAdmin(context.Background(), groupJID, evtNonAdmin) {
-		t.Errorf("Expected regular member NOT to be recognized as admin")
+	if w.IsUserGroupAdmin(context.Background(), groupJIDA, evtNonAdmin) {
+		t.Errorf("Expected regular member NOT to be recognized as admin in Group A")
 	}
 
-	// Case 5: Owner should always be admin even if not in group
+	// Case 8: Owner should always be admin even in Group B where owner is not in participant list
 	evtOwner := &events.Message{}
 	evtOwner.Info.Sender = types.NewJID("6289999999999", types.DefaultUserServer)
-	if !w.IsUserGroupAdmin(context.Background(), groupJID, evtOwner) {
-		t.Errorf("Expected bot owner to be recognized as admin")
+	if !w.IsUserGroupAdmin(context.Background(), groupJIDB, evtOwner) {
+		t.Errorf("Expected bot owner to be recognized as admin in Group B")
 	}
 }
 

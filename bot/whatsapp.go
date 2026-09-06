@@ -412,24 +412,51 @@ func (w *WAClient) IsUserGroupAdmin(ctx context.Context, groupJID types.JID, evt
 		return false
 	}
 
+	// 1. Owner bot selalu memiliki akses admin di semua grup
 	if w.isSenderOwner(evt) {
 		return true
+	}
+
+	// 2. Hanya grup chat yang memiliki admin grup
+	if groupJID.Server != types.GroupServer {
+		return false
 	}
 
 	senderJID := evt.Info.Sender.ToNonAD()
 	senderAlt := evt.Info.SenderAlt.ToNonAD()
 	senderPhone := w.resolveSenderPhone(evt)
 
-	// 1. Cek di grup saat ini jika merupakan group chat
-	if groupJID.Server == types.GroupServer {
-		info := w.GetGroupInfoCached(ctx, groupJID)
-		if info != nil && w.checkParticipantAdmin(info, senderJID, senderAlt, senderPhone) {
-			return true
-		}
+	// 3. Hanya periksa di grup spesifik ini (groupJID), JANGAN periksa grup lain!
+	info := w.GetGroupInfoCached(ctx, groupJID)
+	if info != nil && w.checkParticipantAdmin(info, senderJID, senderAlt, senderPhone) {
+		return true
 	}
 
-	// 2. Jika bukan admin di grup saat ini atau jika perintah dijalankan di PM/DM,
-	// periksa apakah pengirim adalah admin di salah satu grup terkonfigurasi (GroupJIDs atau LogGroupJIDs)
+	return false
+}
+
+// IsOrderModerator memeriksa izin moderasi pesanan imagemap (.acc / .tolak).
+// Di dalam grup, pengirim HARUS menjadi admin di grup tersebut (atau owner bot).
+// Di DM/Private Chat dengan bot, pengirim boleh merupakan admin di salah satu grup terdaftar (GroupJIDs/LogGroupJIDs) atau owner bot.
+func (w *WAClient) IsOrderModerator(ctx context.Context, chatJID types.JID, evt *events.Message) bool {
+	if evt == nil {
+		return false
+	}
+
+	if w.isSenderOwner(evt) {
+		return true
+	}
+
+	// 1. Jika dijalankan di dalam grup, harus admin di grup tersebut
+	if chatJID.Server == types.GroupServer {
+		return w.IsUserGroupAdmin(ctx, chatJID, evt)
+	}
+
+	// 2. Jika di DM/Private Chat, boleh jika pengirim admin di salah satu grup terkonfigurasi
+	senderJID := evt.Info.Sender.ToNonAD()
+	senderAlt := evt.Info.SenderAlt.ToNonAD()
+	senderPhone := w.resolveSenderPhone(evt)
+
 	var allGroups []string
 	allGroups = append(allGroups, w.config.GroupJIDs...)
 	allGroups = append(allGroups, w.config.LogGroupJIDs...)
@@ -445,7 +472,7 @@ func (w *WAClient) IsUserGroupAdmin(ctx context.Context, groupJID types.JID, evt
 		} else {
 			gJID = types.NewJID(clean, types.GroupServer)
 		}
-		if gJID.IsEmpty() || gJID == groupJID {
+		if gJID.IsEmpty() {
 			continue
 		}
 		info := w.GetGroupInfoCached(ctx, gJID)
